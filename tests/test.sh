@@ -331,9 +331,9 @@ SLEEPWALK_LID=closed "$TOOL" sleep
 check "the handoff records the commit it pushed" [ "$(rec sess-wk01 | jq -r .handoff.sha)" = "$(git -C "$T/wake1" rev-parse HEAD)" ]
 
 # Two sessions: one window each, oldest handoff first, after every cloud session is told.
-for s in sess-wk01:200 sess-wk02:100; do
+for s in sess-wk01:100 sess-wk02:200; do
   f="$SLEEPWALK_HOME/sessions/${s%:*}.json"
-  jq --argjson at "${s#*:}" '.handoff.at = $at' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  jq --argjson at "$(( $(date +%s) - ${s#*:} ))" '.handoff.at = $at' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 done
 wake
 check "wake opens one window per session, oldest handoff first" [ "$(opened)" = "resume-sess-wk02.command resume-sess-wk01.command " ]
@@ -410,6 +410,126 @@ check "and rewrites one status line in place" sh -c "printf '%s' \"\$1\" | grep 
 
 export SLEEPWALK_HOME="$saved_home"
 unset SLEEPWALK_NETWORK
+
+# === state hygiene: pruning, leftover files, log rotation, traps, concurrent writes.
+# Uses its own home, so it neither depends on nor disturbs the tests above.
+H="$T/hygiene"; S="$H/sessions"
+sw() { SLEEPWALK_HOME="$H" "$TOOL" "$@"; }
+hhook() { # hhook <event> <session> [cwd] [transcript]
+  jq -n --arg e "$1" --arg s "$2" --arg c "${3:-$T/repo}" --arg tp "${4:-$T/old.jsonl}" \
+    '{session_id: $s, hook_event_name: $e, cwd: $c, transcript_path: $tp}' | sw hook
+}
+hset() { # hset <session> <jq filter>: edits a record by hand
+  jq --argjson now "$(date +%s)" "$2" "$S/$1.json" > "$S/$1.edit" && mv "$S/$1.edit" "$S/$1.json"
+}
+hhas() { [ -f "$S/$1.json" ]; }
+echo old > "$T/old.jsonl"
+touch -t "$(date -v-30d +%Y%m%d%H%M.%S)" "$T/old.jsonl"
+mkdir -p "$H"; : > "$H/last-prune"   # hold off the hourly prune until it is under test
+
+# --- prune: resumed sessions go after RESUMED_KEEP_HOURS, quiet ones after PRUNE_DAYS.
+for s in st-res-old st-res-new st-quiet st-live st-notp st-cloud-new st-cloud-old; do hhook SessionStart "$s"; done
+hset st-res-old '.state = "busy" | .handoff = {status: "resumed", cloud_id: "x", at: ($now - 90000), resumed_at: ($now - 90000)}'
+hset st-res-new '.state = "busy" | .handoff = {status: "resumed", cloud_id: "x", at: ($now - 3600), resumed_at: ($now - 3600)}'
+hset st-quiet '.last_activity = ($now - 8 * 86400)'
+hset st-notp ".last_activity = (\$now - 2 * 86400) | .transcript_path = \"$T/no-such.jsonl\""
+hset st-cloud-new '.last_activity = ($now - 3 * 86400) | .handoff = {status: "cloud", cloud_id: "x", at: ($now - 3 * 86400)}'
+hset st-cloud-old '.last_activity = ($now - 8 * 86400) | .handoff = {status: "returning", cloud_id: "x", at: ($now - 8 * 86400)}'
+touch "$H/resume-st-res-old.command" "$H/resume-st-cloud-new.command"
+out="$(sw prune)"
+check "prune forgets a session teleported back over a day ago" sh -c "[ ! -f '$S/st-res-old.json' ] && [ ! -f '$H/resume-st-res-old.command' ]"
+check "prune keeps one teleported back an hour ago" hhas st-res-new
+check "prune forgets a session quiet for 8 days" [ ! -f "$S/st-quiet.json" ]
+check "prune forgets a quiet session whose transcript is gone" [ ! -f "$S/st-notp.json" ]
+check "prune keeps an active session" hhas st-live
+check "prune keeps a recent cloud handoff and its .command" sh -c "[ -f '$S/st-cloud-new.json' ] && [ -f '$H/resume-st-cloud-new.command' ]"
+check "prune forgets a handoff never resumed in 8 days" [ ! -f "$S/st-cloud-old.json" ]
+check "prune says how many it forgot" [ "$out" = "Pruned 4 session record(s)." ]
+check "prune logs each record it forgets" grep -q 'pruned st-res-old: teleported back' "$H/handoff.log"
+
+# --- orphaned resume .command files go on release, SessionEnd, prune, and after a day.
+touch "$H/resume-st-gone.command" "$H/resume-st-res-new.command"
+touch -t "$(date -v-2d +%Y%m%d%H%M.%S)" "$H/resume-st-cloud-new.command"
+sw prune >/dev/null
+check "prune removes a .command with no record" [ ! -f "$H/resume-st-gone.command" ]
+check "prune removes a .command for a session no longer in the cloud" [ ! -f "$H/resume-st-res-new.command" ]
+check "prune removes a .command unused for a day" [ ! -f "$H/resume-st-cloud-new.command" ]
+check "but keeps the cloud session's record" hhas st-cloud-new
+touch "$H/resume-st-cloud-new.command"
+sw release st-cloud-new >/dev/null
+check "release removes the session's .command" [ ! -f "$H/resume-st-cloud-new.command" ]
+touch "$H/resume-st-live.command"
+hhook SessionEnd st-live
+check "SessionEnd removes the session's .command" [ ! -f "$H/resume-st-live.command" ]
+
+# --- prune clears files left by killed processes, but not fresh ones.
+touch -t "$(date -v-1H +%Y%m%d%H%M.%S)" "$S/st-x.json.123.tmp"
+mkdir "$S/st-x.json.lock"; touch -t "$(date -v-1H +%Y%m%d%H%M.%S)" "$S/st-x.json.lock"
+touch "$S/st-y.json.456.tmp"
+sw prune >/dev/null
+check "prune removes an old temporary record" [ ! -f "$S/st-x.json.123.tmp" ]
+check "prune removes an old record lock" [ ! -d "$S/st-x.json.lock" ]
+check "prune leaves a fresh temporary record" [ -f "$S/st-y.json.456.tmp" ]
+rm -f "$S/st-y.json.456.tmp"
+
+# --- the hourly prune runs from SessionStart, not from every tool call.
+hhook SessionStart st-stale; hset st-stale '.last_activity = ($now - 8 * 86400)'
+hhook PreToolUse st-other
+touch -t "$(date -v-2H +%Y%m%d%H%M.%S)" "$H/last-prune"
+hhook PreToolUse st-other
+check "PreToolUse does not prune" hhas st-stale
+out="$(hhook SessionStart st-other)"
+check "SessionStart prunes once the last prune is an hour old" [ ! -f "$S/st-stale.json" ]
+check "and says nothing to Claude about it" [ -z "$out" ]
+hhook SessionStart st-stale; hset st-stale '.last_activity = ($now - 8 * 86400)'
+hhook SessionStart st-other
+check "it prunes at most once an hour" hhas st-stale
+
+# --- logs rotate past LOG_MAX_KB.
+head -c 3000 /dev/zero | tr '\0' x > "$H/handoff.log"
+head -c 3000 /dev/zero | tr '\0' x > "$H/sleepwatch.log"
+LOG_MAX_KB=2 DEBUG=1 hhook Stop st-other
+check "handoff.log moves to handoff.log.1 past the limit" sh -c "[ \$(wc -c < '$H/handoff.log.1') -ge 3000 ] && [ \$(wc -c < '$H/handoff.log') -lt 200 ]"
+check "the new log carries on" grep -q 'hook Stop st-other' "$H/handoff.log"
+LOG_MAX_KB=2 sw prune >/dev/null
+check "prune rotates sleepwatch.log in place" sh -c "[ -f '$H/sleepwatch.log.1' ] && [ ! -s '$H/sleepwatch.log' ]"
+
+# --- records survive bad input and concurrent writers.
+printf '{"session_id": ' > "$S/st-bad.json"
+: > "$S/st-empty.json"
+hhook UserPromptSubmit st-bad; hhook UserPromptSubmit st-empty
+check "an unreadable record starts afresh" [ "$(jq -r .state "$S/st-bad.json")" = busy ]
+check "an empty record starts afresh" [ "$(jq -r .state "$S/st-empty.json")" = busy ]
+check "no temporary records are left behind" [ -z "$(find "$S" -name '*.tmp' -o -name '*.lock')" ]
+for i in 1 2 3 4 5 6 7 8; do
+  SLEEPWALK_HOME="$H" bash -c '. "$1" help >/dev/null; update_rec st-conc --arg k "$2" ".[\$k] = 1"' _ "$TOOL" "k$i" &
+done
+wait
+check "concurrent writes to one record all land" [ "$(jq 'keys | length' "$S/st-conc.json")" = 8 ]
+hhook SessionEnd st-bad; hhook SessionEnd st-empty; rm -f "$S/st-conc.json"
+
+# --- sleep skips sessions whose folder is gone instead of using its own folder.
+hhook PreToolUse st-nocwd "$T/vanished"
+hhook PreToolUse st-emptycwd; hset st-emptycwd '.cwd = ""'
+n0="$(find "$H" -maxdepth 1 -name 'claude-args-*' | wc -l | tr -d ' ')"
+( cd "$T/repo" && SLEEPWALK_LID=closed SLEEPWALK_HOME="$H" "$TOOL" sleep )
+check "sleep skips a session whose folder is gone" grep -q 'skip st-nocwd: working directory .*vanished is gone' "$H/handoff.log"
+check "and one with no folder at all" grep -q 'skip st-emptycwd: working directory (none) is gone' "$H/handoff.log"
+check "neither starts a cloud session" [ "$(find "$H" -maxdepth 1 -name 'claude-args-*' | wc -l | tr -d ' ')" = "$n0" ]
+hhook SessionEnd st-nocwd; hhook SessionEnd st-emptycwd
+
+# --- traps: set once, never inside a function, and safe when the step is stopped.
+check "no trap is set inside a function" sh -c "! grep -nE '^[[:space:]]+trap ' '$TOOL'"
+err="$(SLEEPWALK_LID=open sw wake 2>&1)"
+check "wake leaves no lock and no errors" sh -c "[ -z \"\$1\" ] && [ ! -d '$H/wake.lock' ]" _ "$err"
+mkrepo hygrepo
+hhook PreToolUse st-term "$T/hygrepo"
+CLAUDE_BIN="$T/fake-claude-lost" SLEEP_BUDGET=15 SLEEPWALK_LID=closed SLEEPWALK_HOME="$H" "$TOOL" sleep 2> "$T/term.err" &
+p=$!
+sleep 3; kill -TERM "$p"; wait "$p" 2>/dev/null; sleep 1
+check "a stopped sleep step reports no errors" [ ! -s "$T/term.err" ]
+check "a stopped sleep step removes its temporary file" sh -c "! ls '$H' | grep -q sleep-candidates"
+check "a stopped sleep step stops its handoffs" sh -c "! pgrep -f '$T/fake-claude-lost' >/dev/null"
 
 echo
 [ "$fails" = 0 ] && echo "all tests passed" || { echo "$fails failed"; exit 1; }
