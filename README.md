@@ -35,7 +35,7 @@ in the cloud, lid opened, session teleported back):
 | Committing and pushing the work in progress | 0 to 2 s |
 | How long Sleepwalk holds off sleep | 7.9 s at most (from the macOS power log) |
 | Lid opened to cloud session told to wrap up | 5 s |
-| Test suite | 81 checks in about 15 s, no network or launchd needed |
+| Test suite | 106 checks in about 15 s, no network or launchd needed |
 
 ## Why this does not exist already
 
@@ -128,7 +128,7 @@ terminal, `~/.claude/sleepwalk/bin/sleepwalk`:
 
 | Command | What it does |
 |---|---|
-| `status` | Tracked sessions, their state and handoffs, and whether the watcher runs |
+| `status [--all] [--json]` | Whether the watcher runs, then each recent session and its handoff (`--all` adds old idle ones; `--json` for scripts) |
 | `resume <session>` | Brings a handed-off session back by hand |
 | `release <session>` | Drops a handoff and unpauses the local copy |
 | `trust <folder>` | Records Claude Code trust for exactly this folder |
