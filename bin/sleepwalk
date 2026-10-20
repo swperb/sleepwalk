@@ -800,7 +800,7 @@ wait_for_network() {
     if [ "$told" = 0 ] && [ $(( $(now) - start )) -ge "$NETWORK_WAIT" ]; then
       told=1
       log "wake: no network after ${NETWORK_WAIT}s; still waiting"
-      notify "Cloud handoff" "No network yet. Your sessions come back as soon as the Mac is online."
+      notify "No network yet. Your sessions come back from the cloud as soon as the Mac is online."
     fi
     sleep 3
   done
@@ -839,10 +839,23 @@ open_resume_terminal() {
     || { rm -f "$cmdfile"; log "could not open $TERMINAL_APP for $sid"; }
 }
 
+# notify <body>: a macOS notification titled "Sleepwalk". The text goes to AppleScript as
+# an argument, never inside the script, so quotes and backslashes need no escaping.
 notify() {
-  log "notify: $1: $2"
+  log "notify: $1"
   [ -n "${SLEEPWALK_NO_NOTIFY:-}" ] && return 0
-  osascript -e "display notification \"$(printf '%s' "$2" | tr -d '"\\')\" with title \"$(printf '%s' "$1" | tr -d '"\\')\"" >/dev/null 2>&1 || true
+  "${OSASCRIPT:-osascript}" - "Sleepwalk" "$1" >/dev/null 2>&1 <<'EOF' || true
+on run argv
+  display notification (item 2 of argv) with title (item 1 of argv)
+end run
+EOF
+}
+
+# repo_name <folder>: the repository's folder name, for notifications.
+repo_name() {
+  local top
+  top="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" || top="$1"
+  basename "$top"
 }
 
 # take_lock <dir>: holds a lock for this process. A lock whose process has died is taken over.
@@ -873,6 +886,7 @@ waiting_to_return() {
 cmd_wake() {
   local lock="$HANDOFF_HOME/wake.lock" f sid order n=0
   if lid_closed; then return 0; fi  # a dark wake (Power Nap); the user is not back
+  log "wake: the lid is open"
   mkdir -p "$HANDOFF_HOME"
   take_lock "$lock" || return 0
   cleanup_add "$lock"
@@ -881,7 +895,7 @@ cmd_wake() {
   order="$(for f in "$SESSIONS"/*.json; do
     [ -f "$f" ] || continue
     if [ "$(field "$f" .handoff.status)" = failed ]; then
-      notify "Cloud handoff failed" "$(field "$f" .handoff.error)"
+      notify "Couldn't hand off $(repo_name "$(field "$f" .cwd)") at sleep: $(field "$f" .handoff.error). Your work is untouched here."
       update_rec "$(basename "$f" .json)" 'del(.handoff)'
     fi
     waiting_to_return "$f" && printf '%s %s\n' "$(field "$f" .handoff.at)" "$(field "$f" .session_id)"
@@ -897,14 +911,14 @@ cmd_wake() {
       [ "$n" -gt 0 ] && sleep 1
       open_resume_terminal "$sid"; n=$((n + 1))
     else
-      notify "Claude session is in the cloud" "Run: sleepwalk resume $(short_id "$sid")"
+      notify "Your session in $(repo_name "$(field "$(rec "$sid")" .cwd)") is still in the cloud. Run: sleepwalk resume $(short_id "$sid")"
     fi
   done
   # The windows may open on another Space, behind a full-screen app. Bring the terminal
   # forward, and say where the sessions are.
   if [ "$n" -gt 0 ]; then
     [ -n "${SLEEPWALK_OPEN:-}" ] || osascript -e "tell application \"$TERMINAL_APP\" to activate" >/dev/null 2>&1
-    notify "Claude is coming back" "$n session(s) resuming in $TERMINAL_APP."
+    notify "$(plural "$n" session) kept working in the cloud — bringing $([ "$n" = 1 ] && echo it || echo them) back in $TERMINAL_APP."
   fi
 }
 
@@ -1109,6 +1123,58 @@ cmd_release() {
   echo "Session $sid is no longer paused. Pull the cloud branch first if you want its work."
 }
 
+# --- status -------------------------------------------------------------------------
+# human_age <seconds>: "just now", "4m", "3h", "2d".
+human_age() {
+  local s="${1:-0}"
+  [ "$s" -ge 0 ] 2>/dev/null || s=0
+  if [ "$s" -lt 60 ]; then echo "just now"
+  elif [ "$s" -lt 3600 ]; then echo "$((s / 60))m"
+  elif [ "$s" -lt 86400 ]; then echo "$((s / 3600))h"
+  else echo "$((s / 86400))d"; fi
+}
+
+# ago <seconds>: "4m ago", or "just now".
+ago() {
+  local a; a="$(human_age "$1")"
+  if [ "$a" = "just now" ]; then echo "$a"; else echo "$a ago"; fi
+}
+
+# short_path <folder>: ~/... under $HOME, and only the folder's name when still long.
+short_path() {
+  local p="$1"
+  # shellcheck disable=SC2088 # a literal ~ is the point
+  case "$p" in "$HOME") p="~" ;; "$HOME"/*) p="~/${p#"$HOME"/}" ;; esac
+  [ "${#p}" -gt 36 ] && p=".../$(basename "$1")"
+  printf '%s' "$p"
+}
+
+plural() { # plural <n> <noun>
+  if [ "$1" = 1 ]; then printf '1 %s' "$2"; else printf '%s %ss' "$1" "$2"; fi
+}
+
+watcher_running() {
+  # SLEEPWALK_WATCHER=running|stopped lets the tests decide.
+  case "${SLEEPWALK_WATCHER:-}" in running) return 0 ;; stopped) return 1 ;; esac
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1
+}
+
+# log_last <regex>: the time, in epoch seconds, of the last handoff.log line whose message
+# matches the extended regex. Prints nothing when there is none.
+log_last() {
+  local line
+  [ -f "$LOG" ] || return 0
+  line="$(grep -E "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} ($1)" "$LOG" | tail -1)"
+  [ -n "$line" ] || return 0
+  date -j -f '%Y-%m-%d %H:%M:%S' "$(printf '%s' "$line" | cut -c1-19)" +%s 2>/dev/null
+}
+
+all_records() { local f; for f in "$SESSIONS"/*.json; do [ -f "$f" ] && cat "$f"; done; }
+
+# Sessions with no handoff in progress that have been quiet this long are left out of
+# `status` unless --all is given.
+STATUS_HIDE_DAYS="${STATUS_HIDE_DAYS:-3}"
+
 # --- prune --------------------------------------------------------------------------
 # Forgets what is no longer needed: sessions teleported back more than RESUMED_KEEP_HOURS
 # ago, handoffs and sessions with no activity for PRUNE_DAYS, sessions whose transcript
@@ -1141,6 +1207,7 @@ EOF
         [ $((t - at)) -gt $((RESUMED_KEEP_HOURS * 3600)) ] && prune_rec "$sid" "teleported back over ${RESUMED_KEEP_HOURS}h ago" ;;
       cloud|returning)
         [ $((t - at)) -gt $((PRUNE_DAYS * 86400)) ] && prune_rec "$sid" "handed off over ${PRUNE_DAYS} days ago and never resumed" ;;
+      failed) ;;   # kept until wake has told the user, which then clears it
       *)
         if [ $((t - last)) -gt $((PRUNE_DAYS * 86400)) ]; then
           prune_rec "$sid" "no activity for ${PRUNE_DAYS} days"
@@ -1180,18 +1247,103 @@ maybe_prune() {
 }
 
 cmd_status() {
-  local f t; t="$(now)"
-  printf '%-10s %-6s %-8s %-10s %s\n' SESSION STATE IDLE HANDOFF "DIRECTORY / CLOUD"
-  for f in "$SESSIONS"/*.json; do
-    [ -f "$f" ] || continue
-    jq -r --argjson t "$t" '[
-        (.session_id[0:8]), (.state // "-"),
-        (((($t - (.last_activity // $t)) / 60) | floor | tostring) + "m"),
-        (.handoff.status // "-"),
-        (.cwd + (if .handoff.url then "  " + .handoff.url elif .handoff.error then "  " + .handoff.error else "" end))
-      ] | @tsv' "$f" | awk -F'\t' '{printf "%-10s %-6s %-8s %-10s %s\n", $1, $2, $3, $4, $5}'
+  local json=0 all=0 t running last_sleep last_wake rows hidden=0 shown=0 summary
+  local n_cloud n_back n_failed n_busy sid cwd branch state h age url err old where what c
+  local b="" d="" g="" y="" r="" x=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1 ;;
+      --all|-a) all=1 ;;
+      *) die "usage: sleepwalk status [--all] [--json]" ;;
+    esac
+    shift
   done
-  if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then echo "sleep watcher: running"; else echo "sleep watcher: not running (sleepwalk install)"; fi
+  t="$(now)"
+  if watcher_running; then running=true; else running=false; fi
+  last_sleep="$(log_last 'sleep: looking|sleep with the lid open')"
+  last_wake="$(log_last 'wake: the lid is open')"
+
+  if [ "$json" = 1 ]; then
+    all_records | jq -s --argjson w "$running" --arg ls "$last_sleep" --arg lw "$last_wake" '{
+        watcher: (if $w then "running" else "stopped" end),
+        last_sleep: ($ls | tonumber? // null),
+        last_wake: ($lw | tonumber? // null),
+        sessions: sort_by(-(.last_activity // 0))
+      }'
+    return 0
+  fi
+
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ]; then
+    b=$'\033[1m' d=$'\033[2m' g=$'\033[32m' y=$'\033[33m' r=$'\033[31m' x=$'\033[0m'
+  fi
+
+  # One row per session, the ones that need attention first (in the cloud, coming back,
+  # failed, working), each group newest first. A busy session quiet for STALE_MINUTES
+  # counts as idle, as it does at sleep. The age is since the handoff for a handed-off
+  # session, and since its last activity otherwise.
+  rows="$(all_records | jq -rs --argjson t "$t" --argjson hide "$((STATUS_HIDE_DAYS * 86400))" \
+      --argjson stale "$((STALE_MINUTES * 60))" '
+    def quiet: $t - (.last_activity // $t);
+    def working: .state == "busy" and quiet <= $stale;
+    def rank: {cloud: 0, returning: 1, failed: 2}[.handoff.status // ""]
+      // (if working then 3 else 4 end);
+    sort_by([rank, -(.last_activity // 0)])[]
+    | (.handoff.status // "") as $h
+    | quiet as $quiet
+    | [ (.session_id // "?")[0:8], (.cwd // ""), (.handoff.branch // ""),
+        (if working then "busy" else "idle" end), $h,
+        (if $h == "" then $quiet else $t - (.handoff.at // .last_activity // $t) end),
+        (.handoff.url // ""), (.handoff.error // ""),
+        (if (rank > 2) and $quiet > $hide then "old" else "" end)
+      ] | map(tostring | gsub("[\u001f\n]"; " ")) | join("\u001f")')"
+
+  n_cloud="$(printf '%s\n' "$rows" | awk -F'\037' '$5 == "cloud"' | grep -c .)"
+  n_back="$(printf '%s\n' "$rows" | awk -F'\037' '$5 == "returning"' | grep -c .)"
+  n_failed="$(printf '%s\n' "$rows" | awk -F'\037' '$5 == "failed"' | grep -c .)"
+  n_busy="$(printf '%s\n' "$rows" | awk -F'\037' '$5 == "" && $4 == "busy" && $9 == ""' | grep -c .)"
+
+  # The summary line, watcher first because nothing is handed off without it.
+  if [ "$running" = true ]; then summary="${g}watcher running${x}"
+  else summary="${r}${b}watcher not running${x} (run: sleepwalk install)"; fi
+  [ "$n_cloud" -gt 0 ] && summary="$summary · ${b}$(plural "$n_cloud" session) in the cloud${x}"
+  [ "$n_back" -gt 0 ] && summary="$summary · $(plural "$n_back" session) coming back"
+  [ "$n_failed" -gt 0 ] && summary="$summary · ${r}$(plural "$n_failed" "failed handoff")${x}"
+  [ "$n_busy" -gt 0 ] && summary="$summary · $n_busy working"
+  [ -n "$last_sleep" ] && summary="$summary · last sleep $(ago $((t - last_sleep)))"
+  [ -n "$last_wake" ] && summary="$summary · last wake $(ago $((t - last_wake)))"
+  printf 'Sleepwalk: %s\n' "$summary"
+
+  if [ -z "$rows" ]; then echo; echo "No Claude Code sessions tracked yet."; return 0; fi
+  echo
+  # Fields are split on the unit separator: a tab would merge empty fields.
+  while IFS=$'\037' read -r sid cwd branch state h age url err old; do
+    if [ "$all" = 0 ] && [ -n "$old" ]; then hidden=$((hidden + 1)); continue; fi
+    shown=$((shown + 1))
+    [ -n "$branch" ] || branch="$(git -C "$cwd" symbolic-ref --short -q HEAD 2>/dev/null)"
+    where="$(short_path "$cwd")"
+    if [ -n "$branch" ]; then
+      where="$where ($branch)"
+      [ "${#where}" -gt 40 ] && where="$(basename "$cwd") ($branch)"
+    fi
+    [ "${#where}" -gt 40 ] && where="${where:0:37}..."
+    case "$h" in
+      cloud) what="in the cloud"; c="$b$g" ;;
+      returning) what="coming back"; c="$y" ;;
+      resumed) what="back (resumed)"; c="$d" ;;
+      failed) what="failed: ${err:-unknown error}"; c="$r" ;;
+      *) if [ "$state" = busy ]; then what="working"; c="$b"; else what="idle"; c="$d"; fi ;;
+    esac
+    printf '  %s%-8s%s  %-40s %s%8s%s  %s%s%s\n' "$d" "$sid" "$x" "$where" "$d" "$(human_age "$age")" "$x" "$c" "$what" "$x"
+    if [ -n "$url" ] && [ "$h" != resumed ]; then printf '            %s\n' "$url"; fi
+  done <<EOF
+$rows
+EOF
+  [ "$shown" -gt 0 ] || echo "  No recent sessions."
+  if [ "$hidden" -gt 0 ]; then
+    echo
+    echo "${d}$(plural "$hidden" "older idle session") not shown (sleepwalk status --all)${x}"
+  fi
+  return 0
 }
 
 # --- install ------------------------------------------------------------------------
@@ -1295,7 +1447,9 @@ sleepwalk: hand busy Claude Code sessions to the cloud when the Mac sleeps.
   install [--plugin] build the sleep watcher, load it with launchd, and add the hooks
                      to settings.json (--plugin: the plugin provides the hooks)
   uninstall          remove the sleep watcher and the hooks
-  status             list tracked sessions and their handoffs
+  status [--all] [--json]
+                     whether the watcher runs, and each session and its handoff
+                     (--all: include old idle sessions; --json: for scripts)
   resume <session>   bring a handed-off session back here with claude --teleport
   release <session>  drop a handoff and unpause the local copy
   prune              forget old session records and leftover files (also runs hourly)

@@ -307,6 +307,98 @@ check "install --plugin adds no settings hooks" [ "$(jq '[.hooks[][] .hooks[] | 
 check "install --plugin still writes the launch agent" [ -f "$SLEEPWALK_PLIST" ]
 check "SessionStart is quiet once installed" [ -z "$(hook SessionStart sess-gggg7777)" ]
 
+# === status and notifications ===========================================================
+# Self-contained: its own home with hand-written records, a fake osascript that records
+# what it is given, and the watcher state forced with SLEEPWALK_WATCHER.
+(
+  fails=0   # counted here, added to the total below
+  SW="$T/status-home"; export SLEEPWALK_HOME="$SW"
+  mkdir -p "$SW/sessions"
+  now="$(date +%s)"
+  srec() { echo "$2" > "$SW/sessions/$1.json"; }
+  srec aaaa1111-cloud "{\"session_id\":\"aaaa1111-cloud\",\"cwd\":\"$HOME/Projects/cad-app\",\"state\":\"busy\",\"last_activity\":$((now - 7300)),
+    \"handoff\":{\"status\":\"cloud\",\"cloud_id\":\"session_01TEST\",\"url\":\"https://claude.ai/code/session_01TEST\",\"branch\":\"feature/fillet\",\"at\":$((now - 7200))}}"
+  srec bbbb2222-busy "{\"session_id\":\"bbbb2222-busy\",\"cwd\":\"$T/repo\",\"state\":\"busy\",\"last_activity\":$((now - 5))}"
+  srec cccc3333-fail "{\"session_id\":\"cccc3333-fail\",\"cwd\":\"$T/trusted\",\"state\":\"idle\",\"last_activity\":$((now - 300)),
+    \"handoff\":{\"status\":\"failed\",\"error\":\"git push of topic failed\",\"at\":$((now - 240))}}"
+  srec dddd4444-old "{\"session_id\":\"dddd4444-old\",\"cwd\":\"$T/repo\",\"state\":\"busy\",\"last_activity\":$((now - 9 * 86400))}"
+  srec eeee5555-back "{\"session_id\":\"eeee5555-back\",\"cwd\":\"$T/repo\",\"state\":\"busy\",\"last_activity\":$((now - 4000)),
+    \"handoff\":{\"status\":\"resumed\",\"cloud_id\":\"session_01OLD\",\"url\":\"https://claude.ai/code/session_01OLD\",\"branch\":\"feature\",\"at\":$((now - 3700))}}"
+  { echo "$(date -r $((now - 7210)) '+%Y-%m-%d %H:%M:%S') sleep: looking for busy sessions"
+    echo "$(date -r $((now - 3600)) '+%Y-%m-%d %H:%M:%S') wake: the lid is open"; } > "$SW/handoff.log"
+
+  out="$(SLEEPWALK_WATCHER=running "$TOOL" status)"
+  line1="$(printf '%s\n' "$out" | head -1)"
+  check "status: the summary line comes first, watcher first" \
+    [ "$line1" = "Sleepwalk: watcher running · 1 session in the cloud · 1 failed handoff · 1 working · last sleep 2h ago · last wake 1h ago" ]
+  check "status: a handed-off session shows its short path, branch, age and state" \
+    sh -c "printf '%s\n' \"\$1\" | grep -qE '^  aaaa1111  ~/Projects/cad-app \\(feature/fillet\\) +2h  in the cloud\$'" _ "$out"
+  check "status: the cloud link has its own indented line" \
+    sh -c "printf '%s\n' \"\$1\" | grep -qx '            https://claude.ai/code/session_01TEST'" _ "$out"
+  check "status: a failed handoff says why" sh -c "printf '%s\n' \"\$1\" | grep -qE '4m  failed: git push of topic failed\$'" _ "$out"
+  check "status: a working session reads just now" sh -c "printf '%s\n' \"\$1\" | grep -qE 'bbbb2222 .*\\(feature\\) +just now  working\$'" _ "$out"
+  check "status: a resumed session reads back (resumed)" sh -c "printf '%s\n' \"\$1\" | grep -qE 'eeee5555 .* 1h  back \\(resumed\\)\$'" _ "$out"
+  check "status: sessions in the cloud are listed first" [ "$(printf '%s\n' "$out" | sed -n 3p | cut -c3-10)" = aaaa1111 ]
+  check "status: old idle sessions are hidden and counted" \
+    sh -c "printf '%s\n' \"\$1\" | grep -q 'dddd4444' && exit 1; printf '%s\n' \"\$1\" | grep -q '^1 older idle session not shown'" _ "$out"
+  check "status --all shows them, as idle" sh -c "SLEEPWALK_WATCHER=running '$TOOL' status --all | grep -qE 'dddd4444 .* 9d  idle\$'"
+  check "status: no colour when piped" sh -c "! printf '%s' \"\$1\" | grep -q \"\$(printf '\\033')\"" _ "$out"
+  tty_out="$(TERM=xterm SLEEPWALK_WATCHER=running script -q /dev/null "$TOOL" status </dev/null)"
+  check "status: colour on a terminal" sh -c "printf '%s' \"\$1\" | grep -q \"\$(printf '\\033')\\[\"" _ "$tty_out"
+  tty_out="$(TERM=xterm NO_COLOR=1 SLEEPWALK_WATCHER=running script -q /dev/null "$TOOL" status </dev/null)"
+  check "status: NO_COLOR turns colour off" sh -c "! printf '%s' \"\$1\" | grep -q \"\$(printf '\\033')\"" _ "$tty_out"
+  check "status: a stopped watcher is called out" \
+    sh -c "SLEEPWALK_WATCHER=stopped '$TOOL' status | head -1 | grep -q '^Sleepwalk: watcher not running (run: sleepwalk install)'"
+  check "status: an empty home says so" \
+    sh -c "SLEEPWALK_HOME='$T/status-empty' SLEEPWALK_WATCHER=stopped '$TOOL' status | grep -q 'No Claude Code sessions tracked yet'"
+  check "status rejects unknown options" sh -c "! '$TOOL' status --bogus 2>/dev/null"
+
+  js="$(SLEEPWALK_WATCHER=running "$TOOL" status --json)"
+  check "status --json gives the watcher and every record" \
+    [ "$(printf '%s' "$js" | jq -r '.watcher + " " + (.sessions | length | tostring)')" = "running 5" ]
+  check "status --json keeps the handoff fields" \
+    [ "$(printf '%s' "$js" | jq -r '.sessions[] | select(.session_id == "aaaa1111-cloud") | .handoff.url')" = https://claude.ai/code/session_01TEST ]
+  check "status --json gives the last sleep and wake as epoch seconds" \
+    [ "$(printf '%s' "$js" | jq -r '[.last_sleep, .last_wake] | map(type) | join(",")')" = "number,number" ]
+
+  # notify passes its text as arguments, so quotes and backslashes arrive intact.
+  cat > "$T/fake-osascript" <<'EOF'
+#!/bin/bash
+{ printf '%s\0' "$@"; printf 'STDIN\0'; cat; } >> "$SLEEPWALK_HOME/notified"
+EOF
+  chmod +x "$T/fake-osascript"
+  check "real osascript receives quotes and backslashes untouched" \
+    [ "$(osascript - 'It'"'"'s "done" \ ok' <<'EOF'
+on run argv
+  return item 1 of argv
+end run
+EOF
+)" = 'It'"'"'s "done" \ ok' ]
+
+  printf '%s' '{"session_id":"ffff6666-fail","cwd":"'"$T"'/repo","handoff":{"status":"failed","error":"push \"rejected\" \\ here"}}' > "$SW/sessions/ffff6666-fail.json"
+  rm -f "$SW/sessions/cccc3333-fail.json" "$SW/notified"
+  # With no network, wake keeps waiting while the lid is open; stop it once it has said so.
+  SLEEPWALK_NO_NOTIFY='' OSASCRIPT="$T/fake-osascript" NETWORK_WAIT=1 SLEEPWALK_LID=open SLEEPWALK_NETWORK=fake "$TOOL" wake &
+  wpid=$!
+  for _ in 1 2 3 4 5 6 7 8; do grep -q 'No network yet' "$SW/notified" 2>/dev/null && break; sleep 1; done
+  pkill -P "$wpid" 2>/dev/null; kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+  rm -rf "$SW/wake.lock"
+  notes="$(tr '\0' '\n' < "$SW/notified" 2>/dev/null)"
+  check "with no network at wake, the notification says the sessions come back once online" \
+    sh -c "printf '%s' \"\$1\" | grep -q '^No network yet. Your sessions come back from the cloud'" _ "$notes"
+  check "notifications are titled Sleepwalk" [ "$(tr '\0' '\n' < "$SW/notified" | sed -n 2p)" = Sleepwalk ]
+  check "notify hands the text to AppleScript as arguments" sh -c "printf '%s' \"\$1\" | grep -q '^on run argv\$'" _ "$notes"
+  check "a failed handoff notification names the repo and keeps quotes" \
+    sh -c "printf '%s' \"\$1\" | grep -qF 'Couldn'\"'\"'t hand off repo at sleep: push \"rejected\" \\ here.'" _ "$notes"
+  check "wake is logged, for status" grep -q ' wake: the lid is open$' "$SW/handoff.log"
+
+  rm -f "$SW/notified"; touch "$SW/net-up"
+  SLEEPWALK_NO_NOTIFY='' SLEEPWALK_OPEN=true OSASCRIPT="$T/fake-osascript" AUTO_RESUME=1 TERMINAL_APP=Terminal SLEEPWALK_LID=open SLEEPWALK_NETWORK=fake "$TOOL" wake 2>/dev/null
+  check "at wake, sessions coming back from the cloud get one notification" \
+    sh -c "tr '\\0' '\\n' < '$SW/notified' | grep -qx '1 session kept working in the cloud — bringing it back in Terminal.'"
+  exit "$fails"
+) || fails=$((fails + $?))
+
 # --- the cloud brief: what was in flight, the task list, and no Sleepwalk notes. -------
 # A synthetic transcript in the shapes Claude Code writes: a SessionStart hook attachment,
 # tool_use / tool_result pairs, a background Bash whose completion arrives as a
@@ -584,7 +676,7 @@ NETWORK_WAIT=1 wake &
 wpid=$!
 sleep 5
 check "with no network, wake keeps waiting past NETWORK_WAIT" kill -0 "$wpid"
-check "and says so in one notification" [ "$(grep -c 'notify: Cloud handoff: No network yet' "$SLEEPWALK_HOME/handoff.log")" = 1 ]
+check "and says so in one notification" [ "$(grep -c 'notify: No network yet' "$SLEEPWALK_HOME/handoff.log")" = 1 ]
 check "nothing opens while offline" [ -z "$(opened)" ]
 touch "$SLEEPWALK_HOME/net-up"
 for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$wpid" 2>/dev/null || break; sleep 1; done

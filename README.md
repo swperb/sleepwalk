@@ -144,7 +144,7 @@ terminal, `~/.claude/sleepwalk/bin/sleepwalk`:
 
 | Command | What it does |
 |---|---|
-| `status` | Tracked sessions, their state and handoffs, and whether the watcher runs |
+| `status [--all] [--json]` | Whether the watcher runs, then each recent session and its handoff (`--all` adds old idle ones; `--json` for scripts) |
 | `resume <session>` | Brings a handed-off session back by hand |
 | `release <session>` | Drops a handoff and unpauses the local copy |
 | `prune` | Forgets old session records and leftover files now (it also runs hourly) |
