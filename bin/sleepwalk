@@ -150,11 +150,19 @@ cmd_trust() {
 # --- hook ---------------------------------------------------------------------------
 # Claude Code runs this for SessionStart, UserPromptSubmit, PreToolUse, Stop and
 # SessionEnd. It keeps a record of each session's state, and blocks a paused session.
+#
+# A subagent's tool calls arrive with its parent's session_id, plus agent_id and
+# agent_type, and with the subagent's own cwd (a .claude/worktrees/agent-* checkout when
+# it runs isolated in a worktree). They show the session is alive, but they must not move
+# its folder or change its state, or a lid close would hand off the subagent's worktree as
+# the session. Their folders are kept in .worktrees so a handoff can report leftover work.
 cmd_hook() {
-  local input sid event cwd transcript f status url t
+  local input sid event cwd transcript agent f status url t main
   input="$(cat)"
-  IFS=$'\t' read -r sid event cwd transcript <<EOF
-$(printf '%s' "$input" | jq -r '[.session_id // "", .hook_event_name // "", .cwd // "", .transcript_path // ""] | @tsv' 2>/dev/null)
+  # Split on the unit separator, not a tab: read collapses empty tab-separated fields,
+  # which would shift the ones after them.
+  IFS=$'\037' read -r sid event cwd transcript agent <<EOF
+$(printf '%s' "$input" | jq -r '[.session_id, .hook_event_name, .cwd, .transcript_path, .agent_id] | map(. // "" | tostring) | join("\u001f")' 2>/dev/null)
 EOF
   [ -n "${sid:-}" ] || return 0
   # Sleepwalk's own claude calls (creating and messaging cloud sessions) run with
@@ -177,6 +185,25 @@ EOF
         jq -n --arg r "$(paused_reason "$sid" "$status" "$url")" \
           '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}' ;;
     esac
+    return 0
+  fi
+
+  # Older Claude Code versions may not send agent_id. A tool call from inside an Agent
+  # tool worktree of the session's own folder is a subagent's too.
+  if [ -z "$agent" ] && [ -f "$f" ]; then
+    main="$(field "$f" .cwd)"
+    case "$event:$cwd" in
+      PreToolUse:"$main"/.claude/worktrees/agent-*|Stop:"$main"/.claude/worktrees/agent-*)
+        [ -n "$main" ] && agent=worktree ;;
+    esac
+  fi
+  if [ -n "$agent" ]; then
+    # The parent's own Agent tool call creates the record first. Without one there is no
+    # main folder to keep, so nothing is recorded.
+    [ -f "$f" ] || return 0
+    update_rec "$sid" --arg cwd "$cwd" --argjson t "$t" '.last_activity = $t
+      | if $cwd != "" and $cwd != .cwd
+        then .worktrees = ((((.worktrees // []) - [$cwd]) + [$cwd]) | .[-20:]) else . end'
     return 0
   fi
 
@@ -203,7 +230,7 @@ EOF
 # Builds the cloud agent's instructions from the session transcript: the original
 # request, then the most recent conversation, trimmed to BRIEF_CHARS.
 make_brief() {
-  local transcript="$1" branch="$2" excerpt
+  local transcript="$1" branch="$2" left="${3:-}" excerpt
   excerpt="$(jq -rs --argjson max "$BRIEF_CHARS" '
     def texts: if type == "string" then [.]
       else [.[]? | select(.type == "text") | .text] end
@@ -222,9 +249,26 @@ You are taking over a Claude Code session that was running on the user's laptop.
 The branch $branch holds the local work, including a final "WIP: hand off to cloud" commit with whatever was uncommitted. Follow the repository's CLAUDE.md or AGENTS.md.
 
 Continue the task where the local session left off. Commit and push small, working steps often, because the user may come back at any moment and pull your branch back to the laptop. If you receive a message saying the user is back, commit and push everything, then stop.
-
-$excerpt
 EOF
+  if [ -n "$left" ]; then
+    printf '\nSubagents of the local session were working in separate git worktrees on the laptop. Their uncommitted changes stayed there and are not on your branch:\n'
+    printf '%s\n' "$left" | sed 's/^/  - /'
+    printf 'Check which of that work the task still needs, and redo it here if so.\n'
+  fi
+  printf '\n%s\n' "$excerpt"
+}
+
+# subagent_worktrees <record>: prints the subagent worktrees recorded for a session that
+# still have uncommitted changes, other than the session's own tree (the current folder).
+# Those changes are not part of the handoff commit.
+subagent_worktrees() {
+  local own w
+  own="$(git rev-parse --show-toplevel 2>/dev/null)"
+  jq -r '.worktrees[]? // empty' "$1" 2>/dev/null | while IFS= read -r w; do
+    [ -d "$w" ] || continue
+    [ "$(git -C "$w" rev-parse --show-toplevel 2>/dev/null)" = "$own" ] && continue
+    [ -n "$(git -C "$w" status --porcelain 2>/dev/null)" ] && printf '%s\n' "$w"
+  done
 }
 
 # --- sleep --------------------------------------------------------------------------
@@ -342,7 +386,7 @@ undo_handoff() {
 
 handoff_one() {
   local f="$1" dry="$2" deadline="$3" sid cwd transcript branch default newb brief cloud_id url t0
-  local orig prev_remote made_branch=0 made_commit=0 pushed=0
+  local orig prev_remote made_branch=0 made_commit=0 pushed=0 left w
   t0="$(now)"
   sid="$(field "$f" .session_id)"
   cwd="$(field "$f" .cwd)"
@@ -353,6 +397,14 @@ handoff_one() {
   # The lid may have opened while the handoff was waiting (for example on a privacy prompt).
   if [ "$dry" != 1 ] && [ "$TRIGGER" = lid ] && ! lid_closed; then
     log "skip $sid: the lid opened before the handoff began"; return
+  fi
+  # Subagents' worktrees are separate checkouts, so their uncommitted work is not handed
+  # off. Say where it is.
+  left="$(subagent_worktrees "$f")"
+  if [ -n "$left" ]; then
+    printf '%s\n' "$left" | while IFS= read -r w; do
+      log "  $sid: subagent worktree $w has uncommitted changes, which stay on this Mac"
+    done
   fi
 
   branch="$(git symbolic-ref --short -q HEAD)"
@@ -370,12 +422,14 @@ handoff_one() {
 
   if [ "$dry" = 1 ]; then
     log "dry run $sid: would commit, push $branch and start a cloud session from $cwd"
-    make_brief "$transcript" "$branch" > "$HANDOFF_HOME/dry-run-brief-$sid.txt"
+    make_brief "$transcript" "$branch" "$left" > "$HANDOFF_HOME/dry-run-brief-$sid.txt"
     return
   fi
 
   prev_remote="$(git rev-parse -q --verify "refs/remotes/origin/$branch" 2>/dev/null)"
-  if [ "$INCLUDE_UNTRACKED" = 1 ]; then git add -A; else git add -u; fi
+  # Claude Code's own worktrees (.claude/worktrees) are separate checkouts; adding them
+  # would commit them as broken embedded-repository links.
+  if [ "$INCLUDE_UNTRACKED" = 1 ]; then git add -A -- ':/' ':(top,exclude).claude/worktrees'; else git add -u; fi
   if ! git diff --cached --quiet; then
     git commit -q -s --no-verify -m "WIP: hand off to cloud while the laptop sleeps" \
       -m "Committed automatically by sleepwalk for Claude Code session $sid." \
@@ -388,7 +442,7 @@ handoff_one() {
   pushed=1
   log "  $sid: committed and pushed $branch after $(( $(now) - t0 ))s"
 
-  brief="$(make_brief "$transcript" "$branch")"
+  brief="$(make_brief "$transcript" "$branch" "$left")"
   # Leave time before the deadline to undo the push and record the result.
   cloud_id="$(cloud_create "$brief" "$sid" $((deadline - 4)))"
   if [ -z "$cloud_id" ]; then
