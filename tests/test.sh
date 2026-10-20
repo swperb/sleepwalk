@@ -18,6 +18,7 @@ export CLAUDE_CONFIG_FILE="$T/claude.json"
 echo '{"projects": {}}' > "$CLAUDE_CONFIG_FILE"
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
 export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
+export SLEEPWALK_NO_NOTIFY=1
 
 fails=0
 check() { # check <description> <command...>
@@ -34,6 +35,7 @@ printf '%s\0' "$@" > "$SLEEPWALK_HOME/claude-args-$(printf %03d "$n")"
 case " $* " in
   *" -p "*" --cloud session_01TEST "*) echo '{"ok":true,"session_id":"session_01TEST","url":"https://claude.ai/code/session_01TEST?from=cli"}' ;;
   *" -p "*" --cloud "*) echo '{"ok":false,"error":"Session not found"}'; exit 1 ;;
+  *" --teleport "*) exit "${FAKE_TELEPORT_RC:-0}" ;;
   *" --cloud "*)
     [ -t 1 ] || { echo "Error: --cloud cannot be combined with --print." >&2; exit 1; }
     if [ "${FAKE_TRUST:-0}" = 1 ] && [ "$(jq -r --arg d "$PWD" '.projects[$d].hasTrustDialogAccepted // false' "$CLAUDE_CONFIG_FILE")" != true ]; then
@@ -160,7 +162,8 @@ check "release messages the cloud session" sh -c "cat '$SLEEPWALK_HOME'/claude-a
 # one Terminal types to start the .command, must not cut the wait short.
 touch "$SLEEPWALK_HOME/resume-sess-aaaa1111.command"
 t0="$(date +%s)"
-printf '\n' | WRAPUP_WAIT=3 "$TOOL" resume sess-aaaa >/dev/null
+touch "$SLEEPWALK_HOME/net-up"
+printf '\n' | SLEEPWALK_NETWORK=fake WRAPUP_WAIT=3 "$TOOL" resume sess-aaaa >/dev/null
 check "a pending Enter does not skip the wait" [ $(( $(date +%s) - t0 )) -ge 3 ]
 check "resume removes its .command file" [ ! -f "$SLEEPWALK_HOME/resume-sess-aaaa1111.command" ]
 check "resume marks the session resumed" [ "$(rec | jq -r .handoff.status)" = resumed ]
@@ -303,6 +306,110 @@ check "SessionStart warns when the watcher is not installed" sh -c "printf '%s' 
 check "install --plugin adds no settings hooks" [ "$(jq '[.hooks[][] .hooks[] | select(.command | contains("sleepwalk"))] | length' "$SLEEPWALK_SETTINGS")" = 0 ]
 check "install --plugin still writes the launch agent" [ -f "$SLEEPWALK_PLIST" ]
 check "SessionStart is quiet once installed" [ -z "$(hook SessionStart sess-gggg7777)" ]
+
+# === lid open -> resume ================================================================
+# Wake order, watching the cloud branch, clean output, a failed teleport and no network.
+# Runs in its own home so sessions from the tests above do not join in.
+saved_home="$SLEEPWALK_HOME"
+export SLEEPWALK_HOME="$T/handoff-wake" SLEEPWALK_NETWORK=fake
+mkdir -p "$SLEEPWALK_HOME" && touch "$SLEEPWALK_HOME/net-up"
+cat > "$T/fake-open" <<'EOF'
+#!/bin/bash
+basename "$1" >> "$SLEEPWALK_HOME/opened"
+EOF
+chmod +x "$T/fake-open"
+opened() { cat "$SLEEPWALK_HOME/opened" 2>/dev/null | tr '\n' ' '; }
+wrapups() { cat "$SLEEPWALK_HOME"/claude-args-* | tr '\0' '\n' | grep -c 'The user has opened'; }
+wake() { SLEEPWALK_OPEN="$T/fake-open" SLEEPWALK_LID=open "$TOOL" wake; }
+for r in wake1 wake2 wake3; do
+  mkrepo "$r"
+  jq --arg d "$T/$r" '.projects[$d] = {hasTrustDialogAccepted: true}' "$CLAUDE_CONFIG_FILE" > "$T/c.tmp" && mv "$T/c.tmp" "$CLAUDE_CONFIG_FILE"
+done
+hook PreToolUse sess-wk01 "$T/wake1"
+hook PreToolUse sess-wk02 "$T/wake2"
+SLEEPWALK_LID=closed "$TOOL" sleep
+check "the handoff records the commit it pushed" [ "$(rec sess-wk01 | jq -r .handoff.sha)" = "$(git -C "$T/wake1" rev-parse HEAD)" ]
+
+# Two sessions: one window each, oldest handoff first, after every cloud session is told.
+for s in sess-wk01:200 sess-wk02:100; do
+  f="$SLEEPWALK_HOME/sessions/${s%:*}.json"
+  jq --argjson at "${s#*:}" '.handoff.at = $at' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+done
+wake
+check "wake opens one window per session, oldest handoff first" [ "$(opened)" = "resume-sess-wk02.command resume-sess-wk01.command " ]
+check "wake tells each cloud session to wrap up" [ "$(rec sess-wk01 | jq -r .handoff.status) $(rec sess-wk02 | jq -r .handoff.status)" = "returning returning" ]
+check "wake notes where the cloud branch stood" [ "$(rec sess-wk01 | jq -r .handoff.wrapup_sha)" = "$(rec sess-wk01 | jq -r .handoff.sha)" ]
+check "wake leaves no lock behind" [ ! -d "$SLEEPWALK_HOME/wake.lock" ]
+
+# The cloud session pushes while resume waits: resume goes once the branch is quiet.
+br="$(rec sess-wk01 | jq -r .handoff.branch)"
+git clone -q "$T/wake1.git" "$T/cloud1"
+( cd "$T/cloud1" && git switch -q "$br" && echo cloud > cloud.txt && git add cloud.txt \
+  && git commit -q -m "Cloud: finish the fillet tool" )
+( sleep 2; git -C "$T/cloud1" push -q origin "$br" ) &
+t0="$(date +%s)"
+out="$(WRAPUP_WAIT=30 PUSH_QUIET=2 SLEEPWALK_POLL=1 "$TOOL" resume sess-wk01 < /dev/null 2>&1)"
+took=$(( $(date +%s) - t0 ))
+wait
+check "resume goes soon after the cloud push, not after WRAPUP_WAIT" [ "$took" -lt 15 ]
+check "resume lists the cloud session's new commits" sh -c "printf '%s' \"\$1\" | grep -q '^  [0-9a-f]* Cloud: finish the fillet tool\$'" _ "$out"
+check "the header names the repository and branch" sh -c "printf '%s' \"\$1\" | grep -q '^Sleepwalk · wake1\$' && printf '%s' \"\$1\" | grep -q '^  branch  $br\$'" _ "$out"
+check "output that is not a terminal has no escape codes" sh -c "! printf '%s' \"\$1\" | grep -q \"\$(printf '\\033')\"" _ "$out"
+check "resume removes only its own .command file" [ ! -f "$SLEEPWALK_HOME/resume-sess-wk01.command" ] && [ -f "$SLEEPWALK_HOME/resume-sess-wk02.command" ]
+check "resume teleports and marks the session resumed" sh -c "[ \"\$(jq -r .handoff.status '$SLEEPWALK_HOME/sessions/sess-wk01.json')\" = resumed ] && ls '$SLEEPWALK_HOME'/claude-args-* | tail -1 | xargs cat | tr '\0' ' ' | grep -q '^--teleport session_01TEST'"
+check "resume leaves no lock or poll files" sh -c "! ls '$SLEEPWALK_HOME' | grep -q 'lock\|poll'"
+
+# A teleport that fails says what to do next and leaves the session ready to retry.
+out="$(FAKE_TELEPORT_RC=3 WRAPUP_WAIT=1 "$TOOL" resume sess-wk02 < /dev/null 2>&1)"; rc=$?
+check "a failed teleport exits with its code" [ "$rc" = 3 ]
+check "and says how to retry, release or open the web" sh -c "printf '%s' \"\$1\" | grep -q 'resume sess-wk02' && printf '%s' \"\$1\" | grep -q 'release sess-wk02' && printf '%s' \"\$1\" | grep -q 'https://claude.ai/code/session_01TEST'" _ "$out"
+check "the session stays paused, waiting to come back" [ "$(rec sess-wk02 | jq -r .handoff.status)" = returning ]
+told="$(wrapups)"
+rm -f "$SLEEPWALK_HOME/opened"
+wake
+check "the next wake reopens it" [ "$(opened)" = "resume-sess-wk02.command " ]
+check "without messaging the cloud session again" [ "$(wrapups)" = "$told" ]
+rm -f "$SLEEPWALK_HOME/opened"
+mkdir "$SLEEPWALK_HOME/resume-sess-wk02.lock" && echo $$ > "$SLEEPWALK_HOME/resume-sess-wk02.lock/pid"
+wake
+check "a session with a resume window running is left alone" [ -z "$(opened)" ]
+check "a second resume of it refuses" sh -c "! '$TOOL' resume sess-wk02 < /dev/null 2>/dev/null"
+rm -rf "$SLEEPWALK_HOME/resume-sess-wk02.lock"
+WRAPUP_WAIT=1 "$TOOL" resume sess-wk02 < /dev/null > /dev/null 2>&1
+check "a retry brings it back" [ "$(rec sess-wk02 | jq -r .handoff.status)" = resumed ]
+
+# A wrap-up message that does not get through is sent again later.
+hook PreToolUse sess-wk03 "$T/wake3"
+SLEEPWALK_LID=closed "$TOOL" sleep
+rm -f "$SLEEPWALK_HOME/opened"
+CLAUDE_BIN="$T/fake-claude-lost" wake
+check "a session the wrap-up did not reach stays in the cloud" [ "$(rec sess-wk03 | jq -r .handoff.status)" = cloud ]
+
+# No network when the lid opens: resume says so, and wake waits until the Mac is online.
+rm -f "$SLEEPWALK_HOME/net-up" "$SLEEPWALK_HOME/opened"
+out="$(NETWORK_WAIT=1 "$TOOL" resume sess-wk03 < /dev/null 2>&1)"; rc=$?
+check "resume with no network stops with next steps" sh -c "[ $rc = 1 ] && printf '%s' \"\$1\" | grep -q 'Still no network' && printf '%s' \"\$1\" | grep -q 'resume sess-wk03'" _ "$out"
+check "and leaves the session as it was" [ "$(rec sess-wk03 | jq -r .handoff.status)" = cloud ]
+NETWORK_WAIT=1 wake &
+wpid=$!
+sleep 5
+check "with no network, wake keeps waiting past NETWORK_WAIT" kill -0 "$wpid"
+check "and says so in one notification" [ "$(grep -c 'notify: Cloud handoff: No network yet' "$SLEEPWALK_HOME/handoff.log")" = 1 ]
+check "nothing opens while offline" [ -z "$(opened)" ]
+touch "$SLEEPWALK_HOME/net-up"
+for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$wpid" 2>/dev/null || break; sleep 1; done
+kill "$wpid" 2>/dev/null
+check "once online, wake brings the session back" [ "$(opened)" = "resume-sess-wk03.command " ]
+check "and tells the cloud session to wrap up" [ "$(rec sess-wk03 | jq -r .handoff.status)" = returning ]
+
+# On a terminal: a window title and a status line rewritten in place.
+out="$(WRAPUP_WAIT=2 script -q /dev/null "$TOOL" resume sess-wk03 < /dev/null 2>&1)"
+check "on a terminal, resume titles the window after the repository" sh -c "printf '%s' \"\$1\" | grep -q \"\$(printf '\\033]0;Sleepwalk · wake3\\007')\"" _ "$out"
+check "and clears the screen of Terminal's login banner" sh -c "printf '%s' \"\$1\" | grep -q \"\$(printf '\\033\\[2J')\"" _ "$out"
+check "and rewrites one status line in place" sh -c "printf '%s' \"\$1\" | grep -q \"\$(printf '\\r\\033\\[K')Waiting for the cloud session to push\"" _ "$out"
+
+export SLEEPWALK_HOME="$saved_home"
+unset SLEEPWALK_NETWORK
 
 echo
 [ "$fails" = 0 ] && echo "all tests passed" || { echo "$fails failed"; exit 1; }
