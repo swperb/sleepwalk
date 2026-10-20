@@ -1,0 +1,15 @@
+{
+  "name": "sleepwalk",
+  "description": "Sleepwalk: hand busy Claude Code sessions to the cloud when your Mac sleeps.",
+  "owner": {
+    "name": "Stephen Proctor",
+    "url": "https://github.com/swperb"
+  },
+  "plugins": [
+    {
+      "name": "sleepwalk",
+      "source": ".",
+      "description": "Close the lid, Claude keeps working. Hands busy Claude Code sessions to the cloud when your Mac sleeps and brings them back when it wakes."
+    }
+  ]
+}

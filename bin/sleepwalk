@@ -1,0 +1,811 @@
+#!/bin/bash
+# Hands busy Claude Code sessions to Claude Code on the web when the Mac sleeps, and
+# brings them back when it wakes. See README.md.
+#
+# Usage: sleepwalk <command> [args...]   (sleepwalk help for the list)
+#
+# Written for the bash 3.2 that ships with macOS: no associative arrays or mapfile.
+set -u
+
+HANDOFF_HOME="${SLEEPWALK_HOME:-$HOME/.claude/sleepwalk}"
+SESSIONS="$HANDOFF_HOME/sessions"
+LOG="$HANDOFF_HOME/handoff.log"
+CONFIG="$HANDOFF_HOME/config"
+CLAUDE_SETTINGS="${SLEEPWALK_SETTINGS:-$HOME/.claude/settings.json}"
+LABEL="com.github.swperb.sleepwalk"
+PLIST="${SLEEPWALK_PLIST:-$HOME/Library/LaunchAgents/$LABEL.plist}"
+
+# Defaults. Override any of them in $CONFIG, which is sourced as shell, or in the
+# environment.
+TRIGGER="${TRIGGER:-lid}"       # lid: hand off only when the lid is closed; any: on every sleep
+SCOPE="${SCOPE:-busy}"        # busy: sessions in the middle of a turn; recent: idle ones too
+RECENT_MINUTES="${RECENT_MINUTES:-30}" # how recent an idle session's activity must be for SCOPE=recent
+STALE_MINUTES="${STALE_MINUTES:-20}" # a "busy" session quiet for longer than this is treated as idle
+SLEEP_BUDGET="${SLEEP_BUDGET:-22}"   # seconds the sleep step may take; macOS forces sleep at about 30
+INCLUDE_UNTRACKED="${INCLUDE_UNTRACKED:-1}" # commit untracked, non-ignored files in the handoff commit
+AUTO_RESUME="${AUTO_RESUME:-1}"     # on wake, open a terminal that teleports the session back
+WRAPUP_WAIT="${WRAPUP_WAIT:-45}"    # seconds to give the cloud session to push before teleporting
+NETWORK_WAIT="${NETWORK_WAIT:-120}"  # seconds to wait for the network after waking
+TERMINAL_APP="${TERMINAL_APP:-Terminal}" # the app that opens the resume .command file (Terminal, iTerm)
+BRIEF_CHARS="${BRIEF_CHARS:-12000}" # size limit for the conversation excerpt in the cloud brief
+HOTSPOT_SSID="${HOTSPOT_SSID:-}" # Wi-Fi to join when there is no network at sleep or wake (an iPhone hotspot)
+HOTSPOT_WAIT="${HOTSPOT_WAIT:-10}" # seconds to wait for the network after joining it
+DEBUG="${DEBUG:-0}"           # 1: log every hook event (to see which events Claude Code sends)
+CLAUDE_BIN="${CLAUDE_BIN:-}"
+CLAUDE_CONFIG_FILE="${CLAUDE_CONFIG_FILE:-$HOME/.claude.json}"
+NETWORKSETUP="${NETWORKSETUP:-/usr/sbin/networksetup}"  # where Claude Code keeps folder trust
+# shellcheck source=/dev/null
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+WRAPUP_MSG='The user has opened their laptop again and will continue this session locally. Stop starting new work. Commit everything you have (tests may be failing; say so in the commit message), push the branch, and then reply with a short summary of what you did and what is left.'
+
+die() { echo "sleepwalk: $*" >&2; exit 1; }
+
+log() {
+  mkdir -p "$HANDOFF_HOME"
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"
+}
+
+now() { date +%s; }
+
+claude_bin() {
+  if [ -n "$CLAUDE_BIN" ]; then echo "$CLAUDE_BIN"; return; fi
+  command -v claude 2>/dev/null && return
+  [ -x "$HOME/.local/bin/claude" ] && { echo "$HOME/.local/bin/claude"; return; }
+  die "claude is not on PATH; set CLAUDE_BIN in $CONFIG"
+}
+
+rec() { echo "$SESSIONS/$1.json"; }
+
+# update_rec <session-id> [jq options...] <filter>: applies a jq filter to the session's
+# record, creating it if needed. Writes through a temporary file so readers never see a
+# half-written record.
+update_rec() {
+  local f tmp
+  f="$(rec "$1")"; shift
+  mkdir -p "$SESSIONS"
+  tmp="$f.$$.tmp"
+  if [ -f "$f" ]; then jq "$@" "$f" > "$tmp"; else jq -n "$@" > "$tmp"; fi && mv "$tmp" "$f"
+}
+
+field() { jq -r "$2 // empty" "$1" 2>/dev/null; }
+
+lid_closed() {
+  [ -n "${SLEEPWALK_LID:-}" ] && { [ "$SLEEPWALK_LID" = closed ]; return; }
+  ioreg -r -k AppleClamshellState -d 4 2>/dev/null | grep -q '"AppleClamshellState" = Yes'
+}
+
+# A handed-off session stays paused locally until it is resumed or released, so that the
+# cloud agent and the local one never edit the same tree at once.
+is_paused_status() {
+  case "$1" in cloud|returning|resumed) return 0 ;; *) return 1 ;; esac
+}
+
+paused_reason() {
+  local sid="$1" status="$2" url="$3"
+  case "$status" in
+    resumed)
+      printf 'This session was handed off to Claude Code on the web while the Mac slept (%s) and has since been brought back into a new local session with claude --teleport. This copy is out of date and is paused. Run `sleepwalk release %s` to use it anyway.' "$url" "$sid" ;;
+    *)
+      printf 'This session was handed off to Claude Code on the web while the Mac slept (%s), and its work continues there. This local copy is paused so two agents never edit the same tree. Stop and tell the user. To continue locally, run `sleepwalk resume %s` (pulls the cloud conversation back with claude --teleport), or `sleepwalk release %s` to drop the handoff and use this copy.' "$url" "$sid" "$sid" ;;
+  esac
+}
+
+# --- folder trust -------------------------------------------------------------------
+# Interactive Claude Code trusts a folder when the folder or any folder above it is
+# trusted. Creating a cloud session checks the folder itself, so a folder trusted only
+# through a parent asks "do you trust this folder?" at the worst moment, with the lid
+# closing. Sleepwalk never answers that prompt. Instead it asks the user about such
+# folders at session start (trust_hint), and records trust only when they agree
+# (sleepwalk trust). A handoff that meets the prompt fails at once and is rolled back.
+
+# trust_of <folder>: prints "exact" when Claude Code trusts the folder itself,
+# "parent:<folder>" when it trusts only an enclosing folder, and nothing otherwise.
+trust_of() {
+  jq -r --arg d "$1" '
+    (.projects // {}) as $p
+    | if (($p[$d] | type) == "object" and $p[$d].hasTrustDialogAccepted == true) then "exact"
+      else ([$p | to_entries[]
+              | select((.value | type) == "object" and .value.hasTrustDialogAccepted == true)
+              | .key | select(. as $k | $d | startswith($k + "/"))] | max_by(length)) as $parent
+        | if $parent then "parent:" + $parent else empty end
+      end' "$CLAUDE_CONFIG_FILE" 2>/dev/null
+}
+
+# At session start, in a repository trusted only through a parent, asks Claude (once per
+# folder) to check with the user whether to record trust for the folder itself.
+trust_hint() {
+  local d="$1" t marker
+  [ -n "$d" ] || return 0
+  git -C "$d" remote get-url origin >/dev/null 2>&1 || return 0
+  t="$(trust_of "$d")"
+  case "$t" in parent:*) ;; *) return 0 ;; esac
+  marker="$HANDOFF_HOME/trust-asked/$(printf '%s' "$d" | shasum | cut -c1-16)"
+  [ -f "$marker" ] && return 0
+  mkdir -p "$HANDOFF_HOME/trust-asked" && : > "$marker"
+  printf '%s\n' "Sleepwalk: Claude Code trusts $d only through ${t#parent:}. Creating a cloud session checks the folder itself, so Sleepwalk cannot hand this session to the cloud when the lid closes until $d is trusted on its own. Ask the user once, briefly, whether to record trust for $d now. If they agree, run: sleepwalk trust \"$d\""
+}
+
+# sleepwalk trust <folder>: records Claude Code trust for exactly this folder, as answering
+# Yes to its trust prompt would. Run it only when the user has agreed.
+cmd_trust() {
+  local d tmp
+  [ $# -ge 1 ] || die "usage: sleepwalk trust <folder>"
+  d="$(cd "$1" 2>/dev/null && pwd)" || die "no such folder: $1"
+  [ "$(trust_of "$d")" = exact ] && { echo "Claude Code already trusts $d."; return 0; }
+  [ -f "$CLAUDE_CONFIG_FILE" ] || die "$CLAUDE_CONFIG_FILE not found; start claude once first"
+  cp -p "$CLAUDE_CONFIG_FILE" "$CLAUDE_CONFIG_FILE.bak-sleepwalk"
+  tmp="$CLAUDE_CONFIG_FILE.sleepwalk.$$"
+  jq --arg d "$d" '.projects = (.projects // {})
+    | .projects[$d] = ((.projects[$d] // {}) | if type == "object" then . else {} end)
+    | .projects[$d].hasTrustDialogAccepted = true' "$CLAUDE_CONFIG_FILE" > "$tmp" \
+    && chmod 600 "$tmp" && mv "$tmp" "$CLAUDE_CONFIG_FILE" \
+    || { rm -f "$tmp"; die "could not update $CLAUDE_CONFIG_FILE (backup at $CLAUDE_CONFIG_FILE.bak-sleepwalk)"; }
+  log "recorded Claude Code trust for $d"
+  echo "Claude Code now trusts $d (recorded in $CLAUDE_CONFIG_FILE; backup alongside it)."
+}
+
+# --- hook ---------------------------------------------------------------------------
+# Claude Code runs this for SessionStart, UserPromptSubmit, PreToolUse, Stop and
+# SessionEnd. It keeps a record of each session's state, and blocks a paused session.
+cmd_hook() {
+  local input sid event cwd transcript f status url t
+  input="$(cat)"
+  IFS=$'\t' read -r sid event cwd transcript <<EOF
+$(printf '%s' "$input" | jq -r '[.session_id // "", .hook_event_name // "", .cwd // "", .transcript_path // ""] | @tsv' 2>/dev/null)
+EOF
+  [ -n "${sid:-}" ] || return 0
+  # Sleepwalk's own claude calls (creating and messaging cloud sessions) run with
+  # SLEEPWALK_INTERNAL set, and are not sessions to track.
+  [ -n "${SLEEPWALK_INTERNAL:-}" ] && return 0
+  [ "$DEBUG" = 1 ] && log "hook $event $sid"
+  f="$(rec "$sid")"
+  status=""; url=""
+  if [ -f "$f" ]; then
+    status="$(field "$f" .handoff.status)"
+    url="$(field "$f" .handoff.url)"
+  fi
+  t="$(now)"
+
+  if is_paused_status "$status"; then
+    case "$event" in
+      UserPromptSubmit)
+        jq -n --arg r "$(paused_reason "$sid" "$status" "$url")" '{decision: "block", reason: $r}' ;;
+      PreToolUse)
+        jq -n --arg r "$(paused_reason "$sid" "$status" "$url")" \
+          '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}' ;;
+    esac
+    return 0
+  fi
+
+  case "$event" in
+    SessionStart)
+      # Shown to Claude at session start, so it can tell the user setup is unfinished.
+      [ -f "$PLIST" ] || echo "Sleepwalk is enabled but its sleep watcher is not installed, so nothing will be handed off when the lid closes. Suggest the user run /sleepwalk:install."
+      trust_hint "$cwd"
+      update_rec "$sid" --arg sid "$sid" --arg cwd "$cwd" --arg tp "$transcript" --argjson t "$t" \
+        '.session_id = $sid | .cwd = $cwd | .transcript_path = $tp | .state = (.state // "idle") | .last_activity = $t' ;;
+    UserPromptSubmit|PreToolUse)
+      update_rec "$sid" --arg sid "$sid" --arg cwd "$cwd" --arg tp "$transcript" --argjson t "$t" \
+        '.session_id = $sid | .cwd = $cwd | .transcript_path = $tp | .state = "busy" | .last_activity = $t' ;;
+    Stop)
+      update_rec "$sid" --arg sid "$sid" --arg cwd "$cwd" --arg tp "$transcript" --argjson t "$t" \
+        '.session_id = $sid | .cwd = $cwd | .transcript_path = $tp | .state = "idle" | .last_activity = $t' ;;
+    SessionEnd)
+      rm -f "$f" ;;
+  esac
+  return 0
+}
+
+# --- brief --------------------------------------------------------------------------
+# Builds the cloud agent's instructions from the session transcript: the original
+# request, then the most recent conversation, trimmed to BRIEF_CHARS.
+make_brief() {
+  local transcript="$1" branch="$2" excerpt
+  excerpt="$(jq -rs --argjson max "$BRIEF_CHARS" '
+    def texts: if type == "string" then [.]
+      else [.[]? | select(.type == "text") | .text] end
+      | map(select(test("^\\s*<") | not)) | join("\n") ;
+    [ .[] | select((.type == "user" or .type == "assistant") and (.isMeta != true) and (.isSidechain != true))
+      | {who: (if .type == "user" then "USER" else "CLAUDE" end), text: (.message.content | texts)}
+      | select(.text | test("\\S")) ] as $m
+    | ($m | map(select(.who == "USER")) | first | .text // "" | .[0:3000]) as $first
+    | ($m[-30:] | map("\(.who): \(.text | .[0:2000])") | join("\n\n")) as $recent
+    | "ORIGINAL REQUEST:\n\($first)\n\nRECENT CONVERSATION (oldest first, may be cut at the start):\n\($recent | .[-$max:])"
+  ' "$transcript" 2>/dev/null)"
+  [ -n "$excerpt" ] || excerpt="(The local transcript could not be read; work from the repository and the latest commits.)"
+  cat <<EOF
+You are taking over a Claude Code session that was running on the user's laptop. The laptop went to sleep, so the session was handed to you automatically by sleepwalk. The user is away and cannot answer questions; make reasonable decisions and note them.
+
+The branch $branch holds the local work, including a final "WIP: hand off to cloud" commit with whatever was uncommitted. Follow the repository's CLAUDE.md or AGENTS.md.
+
+Continue the task where the local session left off. Commit and push small, working steps often, because the user may come back at any moment and pull your branch back to the laptop. If you receive a message saying the user is back, commit and push everything, then stop.
+
+$excerpt
+EOF
+}
+
+# --- sleep --------------------------------------------------------------------------
+# A session is "busy" from a prompt until Claude Code's Stop hook. The desktop app does
+# not always send Stop, so a busy session counts only while it shows signs of life: a hook
+# event or a write to its transcript within STALE_MINUTES. A long tool call (a big build,
+# say) writes nothing, so keep STALE_MINUTES above the longest one you expect.
+eligible() {
+  local f="$1" status state last t tp seen
+  status="$(field "$f" .handoff.status)"
+  is_paused_status "$status" && return 1
+  state="$(field "$f" .state)"
+  last="$(field "$f" .last_activity)"; last="${last:-0}"
+  tp="$(field "$f" .transcript_path)"
+  if [ -n "$tp" ] && seen="$(stat -f %m "$tp" 2>/dev/null)" && [ "$seen" -gt "$last" ]; then
+    last="$seen"
+  fi
+  t="$(now)"
+  if [ "$state" = busy ] && [ $((t - last)) -le $((STALE_MINUTES * 60)) ]; then return 0; fi
+  if [ "$SCOPE" = recent ] && [ $((t - last)) -le $((RECENT_MINUTES * 60)) ]; then return 0; fi
+  return 1
+}
+
+fail_handoff() {
+  local sid="$1"; shift
+  log "handoff $sid failed: $*"
+  update_rec "$sid" --arg why "$*" --argjson t "$(now)" '.handoff = {status: "failed", error: $why, at: $t}'
+}
+
+HOLDING_PROMPT='Sleepwalk is handing you a Claude Code session from the user'"'"'s laptop, which is going to sleep. Your instructions arrive in the next message. Until it arrives, do nothing.'
+
+# The expect(1) script that creates a cloud session. Creating one is interactive only
+# (`--cloud` refuses `--print`), so it runs under expect in a pseudo-terminal. It prints
+# "ID <session>" when the CLI reports the session, then keeps the client attached for a
+# few seconds so the create completes. If Claude Code asks whether to trust the folder,
+# it prints TRUST_PROMPT and stops; it never answers the prompt.
+CREATE_EXP='
+set timeout [lindex $argv 0]
+set claude [lindex $argv 1]
+set prompt [lindex $argv 2]
+log_user 0
+spawn -noecho $claude --cloud $prompt
+expect {
+  -re {teleport[^\n]*(session_[A-Za-z0-9]+)} {
+    puts "ID $expect_out(1,string)"; flush stdout
+    set timeout 15
+    expect eof
+    exit 0
+  }
+  -re {Quick[^\n]*safety[^\n]*check} { puts "TRUST_PROMPT"; flush stdout; exit 2 }
+  timeout { puts "TIMEOUT"; flush stdout; exit 1 }
+  eof { puts "EOF"; flush stdout; exit 1 }
+}
+'
+
+# cloud_create <brief> <session-id> <deadline>: starts a cloud session for $PWD, gives it
+# the brief, and prints its id. The brief goes as a message with `-p --cloud <id>`, which
+# reports ok only for a session that exists, so it also confirms the create; it is
+# retried until the deadline. Prints nothing on failure, and says why in the log.
+cloud_create() {
+  local exp="$HANDOFF_HOME/cloud-create-$2.exp" res="$HANDOFF_HOME/cloud-create-$2.res"
+  local pid id="" sent=0 out="" wait
+  wait=$(( $3 - $(now) ))
+  [ "$wait" -gt 0 ] || { log "no time left to create a cloud session"; return 0; }
+  printf '%s' "$CREATE_EXP" > "$exp"
+  : > "$res"
+  SLEEPWALK_INTERNAL=1 expect -f "$exp" "$((wait > 2 ? wait - 1 : wait))" "$(claude_bin)" "$HOLDING_PROMPT" > "$res" 2>&1 &
+  pid=$!
+  while [ "$(now)" -lt "$3" ]; do
+    id="$(sed -n 's/^ID //p' "$res" | head -1)"
+    [ -n "$id" ] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  if [ -n "$id" ]; then
+    while [ "$(now)" -lt "$3" ]; do
+      out="$(SLEEPWALK_INTERNAL=1 "$(claude_bin)" -p --output-format json --cloud "$id" "$1" < /dev/null 2>&1)"
+      if [ "$(printf '%s' "$out" | jq -r '.ok // false' 2>/dev/null)" = true ]; then sent=1; break; fi
+      sleep 1
+    done
+  fi
+  kill "$pid" 2>/dev/null
+  if [ "$sent" = 1 ]; then
+    echo "$id"
+  elif [ -n "$id" ]; then
+    log "cloud session $id was created but did not accept the brief: $(printf '%s' "$out" | head -c 300)"
+  elif grep -q '^TRUST_PROMPT' "$res"; then
+    log "Claude Code asked whether to trust $PWD before creating a cloud session, and Sleepwalk does not answer that. If you trust it, run: sleepwalk trust \"$PWD\""
+  else
+    log "claude --cloud reported no session ($(tr -s '\n' ' ' < "$res" | head -c 200))"
+  fi
+  rm -f "$exp" "$res"
+}
+
+# undo_handoff: puts the checkout back as it was before a handoff that failed. Drops the
+# WIP commit (its changes stay in the working tree), returns to the original branch, and
+# takes the branch back off the remote if it was pushed. Uses handoff_one's variables.
+undo_handoff() {
+  local wip
+  wip="$(git rev-parse HEAD)"
+  [ "$made_commit" = 1 ] && git reset -q --mixed HEAD~1
+  if [ "$made_branch" = 1 ]; then
+    git switch -q "$orig" 2>/dev/null || git switch -q --detach "$orig"
+    git branch -q -D "$branch"
+    [ "$pushed" = 1 ] && git push -q origin --delete "$branch" 2>>"$LOG"
+  elif [ "$pushed" = 1 ] && [ "$made_commit" = 1 ]; then
+    if [ -n "$prev_remote" ]; then
+      git push -q --force-with-lease="$branch:$wip" origin "$prev_remote:refs/heads/$branch" 2>>"$LOG"
+    else
+      git push -q origin --delete "$branch" 2>>"$LOG"
+    fi
+  fi
+  log "  $sid: put $PWD back on $orig as it was"
+}
+
+handoff_one() {
+  local f="$1" dry="$2" deadline="$3" sid cwd transcript branch default newb brief cloud_id url t0
+  local orig prev_remote made_branch=0 made_commit=0 pushed=0
+  t0="$(now)"
+  sid="$(field "$f" .session_id)"
+  cwd="$(field "$f" .cwd)"
+  transcript="$(field "$f" .transcript_path)"
+  cd "$cwd" 2>/dev/null || { fail_handoff "$sid" "working directory $cwd is gone"; return; }
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { log "skip $sid: $cwd is not a git checkout"; return; }
+  git remote get-url origin >/dev/null 2>&1 || { log "skip $sid: $cwd has no origin remote"; return; }
+  # The lid may have opened while the handoff was waiting (for example on a privacy prompt).
+  if [ "$dry" != 1 ] && [ "$TRIGGER" = lid ] && ! lid_closed; then
+    log "skip $sid: the lid opened before the handoff began"; return
+  fi
+
+  branch="$(git symbolic-ref --short -q HEAD)"
+  orig="${branch:-$(git rev-parse HEAD)}"
+  default="$(git symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null)"
+  default="${default#origin/}"; default="${default:-main}"
+  if [ -z "$branch" ] || [ "$branch" = "$default" ]; then
+    newb="sleepwalk/$(date +%Y%m%d-%H%M%S)-$(printf '%s' "$sid" | cut -c1-8)"
+    if [ "$dry" = 1 ]; then log "dry run $sid: would create branch $newb"; else
+      git switch -q -c "$newb" || { fail_handoff "$sid" "could not create branch $newb"; return; }
+      made_branch=1
+    fi
+    branch="$newb"
+  fi
+
+  if [ "$dry" = 1 ]; then
+    log "dry run $sid: would commit, push $branch and start a cloud session from $cwd"
+    make_brief "$transcript" "$branch" > "$HANDOFF_HOME/dry-run-brief-$sid.txt"
+    return
+  fi
+
+  prev_remote="$(git rev-parse -q --verify "refs/remotes/origin/$branch" 2>/dev/null)"
+  if [ "$INCLUDE_UNTRACKED" = 1 ]; then git add -A; else git add -u; fi
+  if ! git diff --cached --quiet; then
+    git commit -q -s --no-verify -m "WIP: hand off to cloud while the laptop sleeps" \
+      -m "Committed automatically by sleepwalk for Claude Code session $sid." \
+      || { undo_handoff; fail_handoff "$sid" "git commit failed"; return; }
+    made_commit=1
+  fi
+  if ! git push -q origin "HEAD:refs/heads/$branch" 2>>"$LOG"; then
+    undo_handoff; fail_handoff "$sid" "git push of $branch failed"; return
+  fi
+  pushed=1
+  log "  $sid: committed and pushed $branch after $(( $(now) - t0 ))s"
+
+  brief="$(make_brief "$transcript" "$branch")"
+  # Leave time before the deadline to undo the push and record the result.
+  cloud_id="$(cloud_create "$brief" "$sid" $((deadline - 4)))"
+  if [ -z "$cloud_id" ]; then
+    undo_handoff
+    fail_handoff "$sid" "could not start a cloud session (see the log)"
+    return
+  fi
+  url="https://claude.ai/code/$cloud_id"
+  update_rec "$sid" --arg id "$cloud_id" --arg url "$url" --arg b "$branch" --argjson t "$(now)" \
+    '.handoff = {status: "cloud", cloud_id: $id, url: $url, branch: $b, at: $t}'
+  log "handed $sid ($cwd, $branch) to cloud session $cloud_id $url after $(( $(now) - t0 ))s"
+}
+
+cmd_sleep() {
+  local dry=0 f pids="" deadline running p top prev_top="" cand
+  [ "${1:-}" = --dry-run ] && dry=1
+  if [ "$TRIGGER" = lid ] && ! lid_closed; then log "sleep with the lid open; nothing handed off"; return 0; fi
+  deadline=$(( $(now) + SLEEP_BUDGET ))
+  cand="$HANDOFF_HOME/sleep-candidates.$$"
+  # shellcheck disable=SC2064 # expand now: the path is a local
+  trap "rm -f '$cand'" EXIT
+  # shellcheck disable=SC2064
+  trap "rm -f '$cand'; exit 1" TERM
+  log "sleep: looking for busy sessions"
+  # One cloud session per working tree: when several busy sessions share a tree, only
+  # the most recently active one is handed off, so no two agents race on its commit.
+  for f in "$SESSIONS"/*.json; do
+    [ -f "$f" ] || continue
+    eligible "$f" || continue
+    top="$(git -C "$(field "$f" .cwd)" rev-parse --show-toplevel 2>/dev/null)" || top="$(field "$f" .cwd)"
+    printf '%s\t%s\t%s\n' "$top" "$(field "$f" .last_activity)" "$f"
+  done | sort -t "$(printf '\t')" -k1,1 -k2,2nr > "$cand"
+  if [ -s "$cand" ] && [ -n "$HOTSPOT_SSID" ] && [ "$dry" != 1 ] && ! have_network 3; then
+    join_hotspot "$(( deadline - 8 ))"
+  fi
+  while IFS="$(printf '\t')" read -r top _ f; do
+    if [ "$top" = "${prev_top:-}" ]; then
+      log "skip $(field "$f" .session_id): shares $top with a more recent session"
+      continue
+    fi
+    prev_top="$top"
+    ( handoff_one "$f" "$dry" "$deadline" ) &
+    pids="$pids $!"
+  done < "$cand"
+  [ -n "$pids" ] || { log "sleep: no busy sessions to hand off"; return 0; }
+  # Handoffs run in parallel; anything still running at the deadline is stopped so the
+  # Mac can sleep, and is recorded as failed.
+  while [ "$(now)" -lt "$deadline" ]; do
+    running=0
+    for p in $pids; do kill -0 "$p" 2>/dev/null && running=1; done
+    [ "$running" = 0 ] && break
+    sleep 0.2
+  done
+  for p in $pids; do
+    if kill -0 "$p" 2>/dev/null; then
+      pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null
+      log "a handoff ran past the ${SLEEP_BUDGET}s budget and was stopped"
+    fi
+  done
+  wait 2>/dev/null
+  return 0
+}
+
+# --- network ------------------------------------------------------------------------
+have_network() {
+  # SLEEPWALK_NETWORK=fake lets the tests decide: up once $HANDOFF_HOME/net-up exists.
+  if [ "${SLEEPWALK_NETWORK:-}" = fake ]; then [ -f "$HANDOFF_HOME/net-up" ]; return; fi
+  curl -s -o /dev/null -m "${1:-5}" https://claude.ai
+}
+
+# join_hotspot <deadline>: with no network and HOTSPOT_SSID set (say, an iPhone's Personal
+# Hotspot), joins that Wi-Fi network and waits for the network until HOTSPOT_WAIT or the
+# deadline runs out. macOS supplies the password it saved when the user joined the
+# hotspot by hand; Sleepwalk never handles it.
+join_hotspot() {
+  local dev until
+  [ -n "$HOTSPOT_SSID" ] || return 1
+  dev="$(wifi_device)"
+  [ -n "$dev" ] || { log "no Wi-Fi device found to join $HOTSPOT_SSID"; return 1; }
+  log "no network; joining $HOTSPOT_SSID on $dev"
+  "$NETWORKSETUP" -setairportnetwork "$dev" "$HOTSPOT_SSID" >> "$LOG" 2>&1
+  until=$(( $(now) + HOTSPOT_WAIT ))
+  [ -n "${1:-}" ] && [ "$1" -lt "$until" ] && until="$1"
+  while [ "$(now)" -lt "$until" ]; do
+    have_network 2 && { log "on the network through $HOTSPOT_SSID"; return 0; }
+    sleep 1
+  done
+  log "still no network after joining $HOTSPOT_SSID"
+  return 1
+}
+
+wifi_device() {
+  "$NETWORKSETUP" -listallhardwareports 2>/dev/null \
+    | awk '/^Hardware Port: (Wi-Fi|AirPort)/ { getline; print $2; exit }'
+}
+
+# sleepwalk hotspot [name]: lists the iPhone hotspots macOS has saved (through iCloud,
+# no password needed), or sets HOTSPOT_SSID to the saved network that matches <name>.
+# Matching ignores case and treats a typed ' as the ’ iPhone names use.
+cmd_hotspot() {
+  local dev saved want match n
+  dev="$(wifi_device)"
+  [ -n "$dev" ] || die "no Wi-Fi device found"
+  saved="$("$NETWORKSETUP" -listpreferredwirelessnetworks "$dev" 2>/dev/null | sed -n 's/^[[:space:]]*//p' | grep -i 'iphone\|ipad')"
+  if [ $# -eq 0 ]; then
+    echo "Hotspot now: ${HOTSPOT_SSID:-(none)}"
+    echo "Saved iPhone and iPad hotspots:"
+    printf '%s\n' "$saved" | sed 's/^/  /'
+    echo "Choose one with: sleepwalk hotspot \"<name>\""
+    return 0
+  fi
+  want="$(printf '%s' "$*" | sed "s/'/’/g" | tr '[:upper:]' '[:lower:]')"
+  match="$(printf '%s\n' "$saved" | while IFS= read -r line; do
+    [ "$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')" = "$want" ] && printf '%s\n' "$line"
+  done)"
+  n="$(printf '%s' "$match" | grep -c .)"
+  [ "$n" = 1 ] || die "no saved network is called '$*' (sleepwalk hotspot lists them)"
+  mkdir -p "$HANDOFF_HOME"
+  touch "$CONFIG"
+  grep -v '^HOTSPOT_SSID=' "$CONFIG" > "$CONFIG.tmp"
+  printf 'HOTSPOT_SSID=%q\n' "$match" >> "$CONFIG.tmp"
+  mv "$CONFIG.tmp" "$CONFIG"
+  echo "Sleepwalk will join $match when there is no network at sleep or wake."
+}
+
+# --- wake and resume ----------------------------------------------------------------
+wait_for_network() {
+  local deadline=$(( $(now) + NETWORK_WAIT )) tried=0
+  until have_network 5; do
+    [ "$(now)" -ge "$deadline" ] && return 1
+    # Give the usual networks a few seconds to come back before reaching for the hotspot.
+    if [ "$tried" = 0 ] && [ -n "$HOTSPOT_SSID" ] && [ "$(( deadline - $(now) ))" -lt $(( NETWORK_WAIT - 8 )) ]; then
+      tried=1; join_hotspot && return 0
+    fi
+    sleep 3
+  done
+}
+
+send_wrapup() {
+  local sid="$1" cloud_id
+  cloud_id="$(field "$(rec "$sid")" .handoff.cloud_id)"
+  [ -n "$cloud_id" ] || return 1
+  if SLEEPWALK_INTERNAL=1 "$(claude_bin)" -p --output-format json --cloud "$cloud_id" "$WRAPUP_MSG" < /dev/null >>"$LOG" 2>&1; then
+    log "asked cloud session $cloud_id to wrap up"
+  else
+    log "could not message cloud session $cloud_id; it will keep running"
+  fi
+  update_rec "$sid" --argjson t "$(now)" '.handoff.status = "returning" | .handoff.wrapup_at = $t'
+}
+
+open_resume_terminal() {
+  local sid="$1" cmdfile="$HANDOFF_HOME/resume-$1.command"
+  printf '#!/bin/bash\nexec %q resume %q\n' "$SELF" "$sid" > "$cmdfile"
+  chmod +x "$cmdfile"
+  open -a "$TERMINAL_APP" "$cmdfile" || log "could not open $TERMINAL_APP for $sid"
+}
+
+notify() {
+  osascript -e "display notification \"$(printf '%s' "$2" | tr -d '"\\')\" with title \"$(printf '%s' "$1" | tr -d '"\\')\"" >/dev/null 2>&1 || true
+}
+
+cmd_wake() {
+  local lock="$HANDOFF_HOME/wake.lock" f sid any=0
+  if lid_closed; then return 0; fi  # a dark wake (Power Nap); the user is not back
+  mkdir -p "$HANDOFF_HOME"
+  if ! mkdir "$lock" 2>/dev/null; then
+    # A lock older than ten minutes was left by a wake that died.
+    [ -n "$(find "$lock" -maxdepth 0 -mmin +10 2>/dev/null)" ] || return 0
+    rmdir "$lock" 2>/dev/null; mkdir "$lock" 2>/dev/null || return 0
+  fi
+  # shellcheck disable=SC2064 # expand now: the path is a local
+  trap "rmdir '$lock' 2>/dev/null" EXIT
+  for f in "$SESSIONS"/*.json; do
+    [ -f "$f" ] || continue
+    if [ "$(field "$f" .handoff.status)" = failed ]; then
+      notify "Cloud handoff failed" "$(field "$f" .handoff.error)"
+      update_rec "$(field "$f" .session_id)" 'del(.handoff)'
+    fi
+    [ "$(field "$f" .handoff.status)" = cloud ] && any=1
+  done
+  [ "$any" = 1 ] || return 0
+  wait_for_network || { log "wake: no network after ${NETWORK_WAIT}s"; notify "Cloud handoff" "No network; run sleepwalk resume when online."; return 0; }
+  for f in "$SESSIONS"/*.json; do
+    [ -f "$f" ] || continue
+    [ "$(field "$f" .handoff.status)" = cloud ] || continue
+    sid="$(field "$f" .session_id)"
+    send_wrapup "$sid"
+    if [ "$AUTO_RESUME" = 1 ]; then
+      open_resume_terminal "$sid"
+    else
+      notify "Claude session is in the cloud" "Run: sleepwalk resume $(printf '%s' "$sid" | cut -c1-8)"
+    fi
+  done
+}
+
+# The LaunchAgent's first access to ~/Documents, ~/Desktop or ~/Downloads raises a macOS
+# privacy prompt that blocks until answered. The watcher runs this at start-up, so the
+# prompt comes at install time rather than in the seconds before sleep. Only folders that
+# hold Claude Code projects are touched, so most people see one prompt, once.
+cmd_preflight() {
+  local d name projects="$HOME/.claude/projects" prefix
+  prefix="$(printf '%s' "$HOME" | tr '/.' '--')"
+  for name in Documents Desktop Downloads; do
+    d="$HOME/$name"
+    [ -d "$d" ] || continue
+    set -- "$projects/$prefix-$name" "$projects/$prefix-$name"-*
+    if [ -e "$1" ] || [ -e "$2" ] || grep -qs "\"cwd\": *\"$d" "$SESSIONS"/*.json; then
+      ls "$d" >/dev/null 2>&1
+    fi
+  done
+  return 0
+}
+
+# Accepts a full session id or a unique prefix of one.
+resolve_sid() {
+  local want="$1" f match="" n=0
+  for f in "$SESSIONS"/"$want"*.json; do
+    [ -f "$f" ] || continue
+    match="$(basename "$f" .json)"; n=$((n + 1))
+  done
+  [ "$n" = 1 ] || die "no single session matches '$want' (found $n); see sleepwalk status"
+  echo "$match"
+}
+
+cmd_resume() {
+  local sid f status cloud_id url cwd
+  [ $# -ge 1 ] || die "usage: sleepwalk resume <session-id>"
+  sid="$(resolve_sid "$1")" || exit 1
+  f="$(rec "$sid")"
+  status="$(field "$f" .handoff.status)"
+  cloud_id="$(field "$f" .handoff.cloud_id)"
+  url="$(field "$f" .handoff.url)"
+  cwd="$(field "$f" .cwd)"
+  { is_paused_status "$status" && [ -n "$cloud_id" ]; } || die "session $sid has no cloud handoff to resume"
+  [ "$status" = cloud ] && send_wrapup "$sid"
+  echo "Bringing Claude Code session $sid back from the cloud."
+  echo "  cloud session: ${url:-$cloud_id}"
+  echo "  repository:    $cwd"
+  echo
+  rm -f "$HANDOFF_HOME/resume-$sid.command"
+  echo "Giving the cloud session up to ${WRAPUP_WAIT}s to commit and push. Press Enter to go now."
+  # Terminal starts a .command by typing it into a shell, and that line's Enter can still
+  # be waiting to be read. Discard pending input first, so it does not end the wait.
+  local end rc
+  end=$(( $(now) + WRAPUP_WAIT ))
+  while read -r -t 1 _; do :; done
+  while [ "$(now)" -lt "$end" ]; do
+    read -r -t 1 _ && break   # Enter: go now
+    rc=$?
+    [ "$rc" -gt 128 ] || sleep 1   # end of input rather than a timeout: keep waiting
+  done
+  cd "$cwd" || die "working directory $cwd is gone"
+  if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    echo
+    echo "These files changed here after the handoff, probably written by a process the local"
+    echo "session had started. Teleport will offer to stash them:"
+    git status --short | sed 's/^/  /'
+  fi
+  update_rec "$sid" --argjson t "$(now)" '.handoff.status = "resumed" | .handoff.resumed_at = $t'
+  log "teleporting cloud session $cloud_id back into $cwd"
+  exec "$(claude_bin)" --teleport "$cloud_id"
+}
+
+cmd_release() {
+  local sid f cloud_id
+  [ $# -ge 1 ] || die "usage: sleepwalk release <session-id>"
+  sid="$(resolve_sid "$1")" || exit 1
+  f="$(rec "$sid")"
+  [ "$(field "$f" .handoff.status)" = cloud ] && send_wrapup "$sid"
+  cloud_id="$(field "$f" .handoff.cloud_id)"
+  update_rec "$sid" 'del(.handoff)'
+  log "released $sid from cloud session ${cloud_id:-none}"
+  echo "Session $sid is no longer paused. Pull the cloud branch first if you want its work."
+}
+
+cmd_status() {
+  local f t; t="$(now)"
+  printf '%-10s %-6s %-8s %-10s %s\n' SESSION STATE IDLE HANDOFF "DIRECTORY / CLOUD"
+  for f in "$SESSIONS"/*.json; do
+    [ -f "$f" ] || continue
+    jq -r --argjson t "$t" '[
+        (.session_id[0:8]), (.state // "-"),
+        (((($t - (.last_activity // $t)) / 60) | floor | tostring) + "m"),
+        (.handoff.status // "-"),
+        (.cwd + (if .handoff.url then "  " + .handoff.url elif .handoff.error then "  " + .handoff.error else "" end))
+      ] | @tsv' "$f" | awk -F'\t' '{printf "%-10s %-6s %-8s %-10s %s\n", $1, $2, $3, $4, $5}'
+  done
+  if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then echo "sleep watcher: running"; else echo "sleep watcher: not running (sleepwalk install)"; fi
+}
+
+# --- install ------------------------------------------------------------------------
+HOOK_EVENTS='["SessionStart","UserPromptSubmit","PreToolUse","Stop","SessionEnd"]'
+
+settings_with_hooks() {
+  # Removes any earlier sleepwalk hooks, then adds one per event when $1 is set.
+  jq --arg cmd "$1" --argjson events "$HOOK_EVENTS" '
+    def strip: map(.hooks |= map(select((.command // "") | contains("sleepwalk") | not)))
+      | map(select(.hooks | length > 0));
+    .hooks = (.hooks // {})
+    | reduce $events[] as $e (.;
+        .hooks[$e] = ((.hooks[$e] // []) | strip)
+          + (if $cmd == "" then [] else [
+              (if $e == "PreToolUse" then {matcher: "*"} else {} end)
+              + {hooks: [{type: "command", command: $cmd, timeout: 10}]}
+            ] end)
+        | if .hooks[$e] == [] then del(.hooks[$e]) else . end)
+    | if .hooks == {} then del(.hooks) else . end'
+}
+
+write_settings() {
+  local cmd="$1" tmp
+  mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
+  [ -f "$CLAUDE_SETTINGS" ] || echo '{}' > "$CLAUDE_SETTINGS"
+  cp "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak-sleepwalk"
+  tmp="$CLAUDE_SETTINGS.$$.tmp"
+  settings_with_hooks "$cmd" < "$CLAUDE_SETTINGS" > "$tmp" && mv "$tmp" "$CLAUDE_SETTINGS" \
+    || die "could not update $CLAUDE_SETTINGS (backup at $CLAUDE_SETTINGS.bak-sleepwalk)"
+}
+
+cmd_install() {
+  # --plugin: the Claude Code plugin ships the hooks itself, so leave settings.json alone.
+  local src bin="$HANDOFF_HOME/bin" path_value plugin=0 stamp
+  [ "${1:-}" = --plugin ] && plugin=1
+  src="$(cd "$(dirname "$SELF")/.." && pwd)/src"
+  [ -f "$src/sleepwatch.swift" ] || die "run install from a checkout or the plugin, not the installed copy"
+  command -v jq >/dev/null || die "jq is required"
+  command -v swiftc >/dev/null || die "swiftc is required (xcode-select --install)"
+  mkdir -p "$bin" "$SESSIONS" "$(dirname "$PLIST")"
+  cp "$SELF" "$bin/sleepwalk" && chmod +x "$bin/sleepwalk"
+  # macOS remembers privacy answers per binary, so rebuild only when the source or the
+  # compiler changes, and sign with a fixed identifier; otherwise every install asks again.
+  stamp="$(cat "$src/sleepwatch.swift" | shasum | cut -c1-40) $(swiftc --version 2>&1 | head -1)"
+  if [ ! -x "$bin/sleepwatch" ] || [ "$(cat "$bin/sleepwatch.stamp" 2>/dev/null)" != "$stamp" ]; then
+    swiftc -O "$src/sleepwatch.swift" -o "$bin/sleepwatch" || die "could not build sleepwatch"
+    codesign -f -s - --identifier "$LABEL.sleepwatch" "$bin/sleepwatch" 2>/dev/null \
+      || die "could not sign sleepwatch"
+    printf '%s' "$stamp" > "$bin/sleepwatch.stamp"
+  fi
+  [ -f "$CONFIG" ] || sed -n '/^# Defaults\./,/^CLAUDE_BIN=/p' "$SELF" \
+    | sed -E '$d;s/^([A-Z_]+)="\$\{[A-Z_]+:-([^}]*)\}"/\1=\2/;s/^/# /' > "$CONFIG"
+
+  path_value="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$bin/sleepwatch</string>
+    <string>$bin/sleepwalk</string>
+    <string>$((SLEEP_BUDGET + 3))</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>$path_value</string></dict>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>$HANDOFF_HOME/sleepwatch.log</string>
+  <key>StandardErrorPath</key><string>$HANDOFF_HOME/sleepwatch.log</string>
+</dict>
+</plist>
+EOF
+  if [ "$plugin" = 1 ]; then write_settings ""; else write_settings "\"$bin/sleepwalk\" hook"; fi
+  if [ -z "${SLEEPWALK_NO_LAUNCHD:-}" ]; then
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" || die "launchctl could not load $PLIST"
+  fi
+  if [ "$plugin" = 1 ]; then echo "Installed the sleep watcher. The plugin provides the hooks."
+  else echo "Installed. Hooks added to $CLAUDE_SETTINGS (backup alongside it)."; fi
+  echo "Sessions that are already open pick up the hooks when they next start or resume."
+  echo "Settings: $CONFIG    Log: $LOG"
+}
+
+cmd_uninstall() {
+  [ -z "${SLEEPWALK_NO_LAUNCHD:-}" ] && launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+  rm -f "$PLIST"
+  [ -f "$CLAUDE_SETTINGS" ] && write_settings ""
+  rm -rf "${HANDOFF_HOME:?}/bin"
+  echo "Uninstalled. Session records, config and log are left in $HANDOFF_HOME."
+}
+
+cmd_help() {
+  cat <<'EOF'
+sleepwalk: hand busy Claude Code sessions to the cloud when the Mac sleeps.
+
+  install [--plugin] build the sleep watcher, load it with launchd, and add the hooks
+                     to settings.json (--plugin: the plugin provides the hooks)
+  uninstall          remove the sleep watcher and the hooks
+  status             list tracked sessions and their handoffs
+  resume <session>   bring a handed-off session back here with claude --teleport
+  release <session>  drop a handoff and unpause the local copy
+  trust <folder>     record Claude Code trust for this exact folder (see README)
+  hotspot [name]     list saved iPhone hotspots, or choose the one to join when offline
+  sleep [--dry-run]  what the watcher runs before sleep (dry run writes the brief only)
+  wake               what the watcher runs after wake
+  hook               what Claude Code runs for each hook event (reads JSON on stdin)
+
+Sessions may be given as a unique prefix of the id. See README.md.
+EOF
+}
+
+cmd="${1:-help}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  hook) cmd_hook "$@" ;;
+  sleep) cmd_sleep "$@" ;;
+  preflight) cmd_preflight "$@" ;;
+  trust) cmd_trust "$@" ;;
+  hotspot) cmd_hotspot "$@" ;;
+  wake) cmd_wake "$@" ;;
+  resume) cmd_resume "$@" ;;
+  release) cmd_release "$@" ;;
+  status) cmd_status "$@" ;;
+  install) cmd_install "$@" ;;
+  uninstall) cmd_uninstall "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *) die "unknown command '$cmd' (sleepwalk help)" ;;
+esac

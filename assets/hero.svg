@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0a0f24"/>
+      <stop offset="1" stop-color="#1d2250"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#11162f"/>
+      <stop offset="1" stop-color="#0b0f22"/>
+    </linearGradient>
+    <marker id="head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#f5c26b"/>
+    </marker>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#sky)"/>
+
+  <!-- stars -->
+  <g fill="#ffffff">
+    <circle cx="640" cy="60" r="1.6" opacity=".8"/><circle cx="720" cy="120" r="1.2" opacity=".6"/>
+    <circle cx="820" cy="48" r="1.4" opacity=".7"/><circle cx="905" cy="150" r="1" opacity=".5"/>
+    <circle cx="980" cy="70" r="1.6" opacity=".8"/><circle cx="1210" cy="210" r="1.2" opacity=".6"/>
+    <circle cx="560" cy="150" r="1" opacity=".5"/><circle cx="1240" cy="60" r="1.4" opacity=".7"/>
+    <circle cx="760" cy="200" r="1.1" opacity=".5"/><circle cx="1060" cy="230" r="1" opacity=".4"/>
+  </g>
+
+  <!-- moon -->
+  <circle cx="1130" cy="120" r="52" fill="#f6e7c1"/>
+  <circle cx="1152" cy="104" r="48" fill="#0f1430"/>
+
+  <!-- headline -->
+  <text x="80" y="118" font-size="66" font-weight="800" fill="#ffffff" letter-spacing="-1">Close the lid.</text>
+  <text x="80" y="194" font-size="66" font-weight="800" fill="#f5c26b" letter-spacing="-1">Claude keeps working.</text>
+  <text x="82" y="240" font-size="22" fill="#b9c0e8">Sleepwalk hands your busy Claude Code session to the cloud when your Mac</text>
+  <text x="82" y="270" font-size="22" fill="#b9c0e8">sleeps, and teleports it back to your terminal when you open the lid.</text>
+
+  <!-- stage 1: lid closes -->
+  <g transform="translate(80,320)">
+    <rect width="300" height="210" rx="18" fill="#161b3d" stroke="#2c3370"/>
+    <text x="24" y="40" font-size="15" font-weight="700" fill="#8f98d6" letter-spacing="2">0 s · LID CLOSES</text>
+    <!-- closed laptop, side on -->
+    <rect x="50" y="118" width="200" height="14" rx="6" fill="#9aa3c9"/>
+    <rect x="40" y="132" width="220" height="10" rx="5" fill="#6d76a6"/>
+    <text x="196" y="96" font-size="22" font-weight="700" fill="#8f98d6" opacity=".9">z</text>
+    <text x="214" y="80" font-size="17" font-weight="700" fill="#8f98d6" opacity=".7">z</text>
+    <text x="228" y="67" font-size="13" font-weight="700" fill="#8f98d6" opacity=".5">z</text>
+    <text x="24" y="176" font-size="16" fill="#dfe3ff">Busy session found.</text>
+    <text x="24" y="198" font-size="16" fill="#dfe3ff">Work committed and pushed.</text>
+  </g>
+
+  <!-- arrow 1 -->
+  <line x1="392" y1="425" x2="470" y2="425" stroke="#f5c26b" stroke-width="3" marker-end="url(#head)"/>
+  <text x="431" y="410" font-size="18" font-weight="800" fill="#f5c26b" text-anchor="middle">7 s</text>
+
+  <!-- stage 2: cloud -->
+  <g transform="translate(490,320)">
+    <rect width="300" height="210" rx="18" fill="#161b3d" stroke="#2c3370"/>
+    <text x="24" y="40" font-size="15" font-weight="700" fill="#8f98d6" letter-spacing="2">IN THE CLOUD</text>
+    <g fill="#e9ecff">
+      <circle cx="115" cy="112" r="30"/><circle cx="152" cy="96" r="38"/><circle cx="192" cy="114" r="28"/>
+      <rect x="85" y="112" width="135" height="30" rx="15"/>
+    </g>
+    <text x="152" y="128" font-size="14" font-weight="700" fill="#1d2250" text-anchor="middle">claude.ai/code</text>
+    <text x="24" y="176" font-size="16" fill="#dfe3ff">Same task, same branch.</text>
+    <text x="24" y="198" font-size="16" fill="#dfe3ff">Laptop asleep in your bag.</text>
+  </g>
+
+  <!-- arrow 2 -->
+  <line x1="802" y1="425" x2="880" y2="425" stroke="#f5c26b" stroke-width="3" marker-end="url(#head)"/>
+  <text x="841" y="410" font-size="15" font-weight="800" fill="#f5c26b" text-anchor="middle">lid opens</text>
+
+  <!-- stage 3: back on the laptop -->
+  <g transform="translate(900,320)">
+    <rect width="300" height="210" rx="18" fill="#161b3d" stroke="#2c3370"/>
+    <text x="24" y="40" font-size="15" font-weight="700" fill="#8f98d6" letter-spacing="2">BACK ON YOUR MAC</text>
+    <rect x="50" y="58" width="200" height="92" rx="8" fill="#9aa3c9"/>
+    <rect x="57" y="64" width="186" height="80" rx="4" fill="url(#screen)"/>
+    <text x="68" y="88" font-size="12" font-family="Menlo, monospace" fill="#7ee0a8">$ claude --teleport</text>
+    <text x="68" y="106" font-size="12" font-family="Menlo, monospace" fill="#b9c0e8">Resuming session…</text>
+    <rect x="68" y="116" width="8" height="13" fill="#f5c26b"/>
+    <path d="M36 150 H264 L278 162 H22 Z" fill="#6d76a6"/>
+    <text x="24" y="190" font-size="16" fill="#dfe3ff">Cloud wraps up, you pick up.</text>
+  </g>
+
+  <!-- footer -->
+  <text x="80" y="590" font-size="17" fill="#8f98d6">Claude Code plugin  ·  macOS  ·  MIT</text>
+  <text x="1200" y="590" font-size="17" fill="#8f98d6" text-anchor="end">github.com/swperb/sleepwalk</text>
+</svg>
