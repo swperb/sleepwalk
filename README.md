@@ -35,7 +35,7 @@ in the cloud, lid opened, session teleported back):
 | Committing and pushing the work in progress | 0 to 2 s |
 | How long Sleepwalk holds off sleep | 7.9 s at most (from the macOS power log) |
 | Lid opened to cloud session told to wrap up | 5 s |
-| Test suite | 81 checks in about 15 s, no network or launchd needed |
+| Test suite | 112 checks in about 40 s, no network or launchd needed |
 
 ## Why this does not exist already
 
@@ -90,9 +90,18 @@ original branch is checked out again, and the pushed branch is removed. The sess
 paused, and you get a notification when the Mac wakes.
 
 **When you open the lid.** Sleepwalk waits for the network, tells each cloud session to
-commit, push and stop, and opens a Terminal window. After up to 45 seconds (press Enter
-to skip), it runs `claude --teleport`, which checks out the cloud branch and loads the
-whole cloud conversation.
+commit, push and stop, and opens one Terminal window per session, titled after its
+repository, in the order they were handed off, and brings Terminal to the front. Each window shows the branch, the cloud
+link, the commits the cloud session made while you were away, and one status line. It
+watches the cloud branch on GitHub and runs `claude --teleport` as soon as the cloud
+session has pushed and gone quiet for 8 seconds, or after 45 seconds at most (press
+Enter to go now). Teleport checks out the cloud branch and loads the whole cloud
+conversation.
+
+If the lid opens with no network, Sleepwalk keeps waiting, says so in a notification,
+and brings the sessions back as soon as the Mac is online. If `claude --teleport` fails,
+the window says how to retry (`sleepwalk resume`), open the session on the web, or keep
+the local copy (`sleepwalk release`), and the session stays paused for the next wake.
 
 ## Folder trust
 
@@ -135,6 +144,7 @@ terminal, `~/.claude/sleepwalk/bin/sleepwalk`:
 | `status` | Tracked sessions, their state and handoffs, and whether the watcher runs |
 | `resume <session>` | Brings a handed-off session back by hand |
 | `release <session>` | Drops a handoff and unpauses the local copy |
+| `prune` | Forgets old session records and leftover files now (it also runs hourly) |
 | `trust <folder>` | Records Claude Code trust for exactly this folder |
 | `hotspot [name]` | Lists saved iPhone hotspots, or picks one to join when offline |
 | `sleep --dry-run` | Shows what a sleep would do, and writes the brief, without doing it |
@@ -151,10 +161,14 @@ terminal, `~/.claude/sleepwalk/bin/sleepwalk`:
 | `INCLUDE_UNTRACKED` | `1` | Commit untracked, non-ignored files too |
 | `MAX_FILE_MB` | `50` | Leave files bigger than this out of the WIP commit, so the push is not refused (GitHub's limit is 100 MB). `0` for no limit |
 | `AUTO_RESUME` | `1` | Open a Terminal on wake; `0` shows a notification instead |
-| `WRAPUP_WAIT` | `45` | Seconds the cloud session gets to push before teleporting |
+| `WRAPUP_WAIT` | `45` | Most seconds the cloud session gets to push before teleporting |
+| `PUSH_QUIET` | `8` | Teleport once the cloud branch has moved and then stayed still this long |
 | `TERMINAL_APP` | `Terminal` | For example `iTerm` |
 | `HOTSPOT_SSID` | (none) | Network to join when offline; set it with `sleepwalk hotspot` |
 | `SLEEP_BUDGET` | `22` | Seconds the lid-close step may take (macOS forces sleep at about 30) |
+| `RESUMED_KEEP_HOURS` | `24` | How long to keep a session's record after it was teleported back |
+| `PRUNE_DAYS` | `7` | Forget sessions, and handoffs never resumed, after this many days without activity |
+| `LOG_MAX_KB` | `1024` | Past this size `handoff.log` and `sleepwatch.log` move to `<log>.1` and start afresh |
 
 ## Things to know
 
@@ -168,6 +182,10 @@ terminal, `~/.claude/sleepwalk/bin/sleepwalk`:
 - **Processes the session started keep running.** Sleepwalk pauses the session's tool
   calls, but a build or script it had already started carries on when the Mac wakes. If
   it changes files, `--teleport` offers to stash them.
+- **Old records clean themselves up.** At most once an hour, at session start and on wake,
+  Sleepwalk forgets sessions teleported back over a day ago, sessions and handoffs idle for
+  a week, resume `.command` files nobody ran, and leftovers from killed processes. The
+  old copy of a session teleported back is unpaused when its record goes.
 - **A closed lid with an external display** does not sleep, so nothing is handed off.
 - **Not an Anthropic product.** Sleepwalk is an independent open-source plugin that uses
   Claude Code's public CLI.
