@@ -35,7 +35,7 @@ in the cloud, lid opened, session teleported back):
 | Committing and pushing the work in progress | 0 to 2 s |
 | How long Sleepwalk holds off sleep | 7.9 s at most (from the macOS power log) |
 | Lid opened to cloud session told to wrap up | 5 s |
-| Test suite | 81 checks in about 15 s, no network or launchd needed |
+| Test suite | 112 checks in about 40 s, no network or launchd needed |
 
 ## Why this does not exist already
 
@@ -86,9 +86,18 @@ original branch is checked out again, and the pushed branch is removed. The sess
 paused, and you get a notification when the Mac wakes.
 
 **When you open the lid.** Sleepwalk waits for the network, tells each cloud session to
-commit, push and stop, and opens a Terminal window. After up to 45 seconds (press Enter
-to skip), it runs `claude --teleport`, which checks out the cloud branch and loads the
-whole cloud conversation.
+commit, push and stop, and opens one Terminal window per session, titled after its
+repository, in the order they were handed off, and brings Terminal to the front. Each window shows the branch, the cloud
+link, the commits the cloud session made while you were away, and one status line. It
+watches the cloud branch on GitHub and runs `claude --teleport` as soon as the cloud
+session has pushed and gone quiet for 8 seconds, or after 45 seconds at most (press
+Enter to go now). Teleport checks out the cloud branch and loads the whole cloud
+conversation.
+
+If the lid opens with no network, Sleepwalk keeps waiting, says so in a notification,
+and brings the sessions back as soon as the Mac is online. If `claude --teleport` fails,
+the window says how to retry (`sleepwalk resume`), open the session on the web, or keep
+the local copy (`sleepwalk release`), and the session stays paused for the next wake.
 
 ## Folder trust
 
@@ -147,7 +156,8 @@ terminal, `~/.claude/sleepwalk/bin/sleepwalk`:
 | `STALE_MINUTES` | `20` | A busy session with no sign of life for this long counts as idle. Raise it for very long builds |
 | `INCLUDE_UNTRACKED` | `1` | Commit untracked, non-ignored files too |
 | `AUTO_RESUME` | `1` | Open a Terminal on wake; `0` shows a notification instead |
-| `WRAPUP_WAIT` | `45` | Seconds the cloud session gets to push before teleporting |
+| `WRAPUP_WAIT` | `45` | Most seconds the cloud session gets to push before teleporting |
+| `PUSH_QUIET` | `8` | Teleport once the cloud branch has moved and then stayed still this long |
 | `TERMINAL_APP` | `Terminal` | For example `iTerm` |
 | `HOTSPOT_SSID` | (none) | Network to join when offline; set it with `sleepwalk hotspot` |
 | `SLEEP_BUDGET` | `22` | Seconds the lid-close step may take (macOS forces sleep at about 30) |
