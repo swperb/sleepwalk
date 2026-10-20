@@ -18,6 +18,7 @@ export CLAUDE_CONFIG_FILE="$T/claude.json"
 echo '{"projects": {}}' > "$CLAUDE_CONFIG_FILE"
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
 export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
+export SLEEPWALK_NO_NOTIFY=1
 
 fails=0
 check() { # check <description> <command...>
@@ -34,6 +35,7 @@ printf '%s\0' "$@" > "$SLEEPWALK_HOME/claude-args-$(printf %03d "$n")"
 case " $* " in
   *" -p "*" --cloud session_01TEST "*) echo '{"ok":true,"session_id":"session_01TEST","url":"https://claude.ai/code/session_01TEST?from=cli"}' ;;
   *" -p "*" --cloud "*) echo '{"ok":false,"error":"Session not found"}'; exit 1 ;;
+  *" --teleport "*) exit "${FAKE_TELEPORT_RC:-0}" ;;
   *" --cloud "*)
     [ -t 1 ] || { echo "Error: --cloud cannot be combined with --print." >&2; exit 1; }
     if [ "${FAKE_TRUST:-0}" = 1 ] && [ "$(jq -r --arg d "$PWD" '.projects[$d].hasTrustDialogAccepted // false' "$CLAUDE_CONFIG_FILE")" != true ]; then
@@ -48,7 +50,7 @@ EOF
 chmod +x "$CLAUDE_BIN"
 
 # A repository with an origin remote, on a feature branch, with uncommitted work.
-git init -q --bare "$T/origin.git"
+git init -q --bare -b main "$T/origin.git"
 git init -q -b main "$T/repo"
 ( cd "$T/repo" && git remote add origin "$T/origin.git" && echo one > a.txt && git add a.txt \
   && git commit -q -m init && git push -q origin main && git switch -q -c feature \
@@ -160,7 +162,8 @@ check "release messages the cloud session" sh -c "cat '$SLEEPWALK_HOME'/claude-a
 # one Terminal types to start the .command, must not cut the wait short.
 touch "$SLEEPWALK_HOME/resume-sess-aaaa1111.command"
 t0="$(date +%s)"
-printf '\n' | WRAPUP_WAIT=3 "$TOOL" resume sess-aaaa >/dev/null
+touch "$SLEEPWALK_HOME/net-up"
+printf '\n' | SLEEPWALK_NETWORK=fake WRAPUP_WAIT=3 "$TOOL" resume sess-aaaa >/dev/null
 check "a pending Enter does not skip the wait" [ $(( $(date +%s) - t0 )) -ge 3 ]
 check "resume removes its .command file" [ ! -f "$SLEEPWALK_HOME/resume-sess-aaaa1111.command" ]
 check "resume marks the session resumed" [ "$(rec | jq -r .handoff.status)" = resumed ]
@@ -224,7 +227,7 @@ hook SessionEnd sess-qqqq0000
 
 # --- folder trust. A repository whose parent is trusted, but not the repository itself.
 mkrepo() { # mkrepo <name>: a repository on main with a pushed commit and uncommitted work
-  git init -q --bare "$T/$1.git"
+  git init -q --bare -b main "$T/$1.git"
   git init -q -b main "$T/$1"
   ( cd "$T/$1" && git remote add origin "$T/$1.git" && echo one > a.txt && git add a.txt \
     && git commit -q -m init && git push -q origin main && echo work > w.txt )
@@ -362,6 +365,361 @@ check "brief: git push uses the environment's remote, not origin" sh -c "grep -q
 check "brief: says how to wrap up for the user" bhas 'end with a short summary for the user: what you did, what is left, and any decisions you made for them'
 check "wrap-up message asks for a summary for the user" sh -c "cat '$SLEEPWALK_HOME'/claude-args-* | tr '\0' '\n' | grep -q 'any decisions you made for them'"
 hook SessionEnd sess-brief01 "$T/briefrepo"
+
+# === subagent hook events ===============================================================
+# A subagent's tool calls carry its parent's session_id plus agent_id and agent_type, and
+# the subagent's own cwd: an isolated .claude/worktrees/agent-* checkout. They must keep
+# the session alive without moving its folder or changing its state. Self-contained.
+git init -q --bare "$T/sa-origin.git"
+git init -q -b main "$T/sa"
+( cd "$T/sa" && git remote add origin "$T/sa-origin.git" && echo one > a.txt && git add a.txt \
+  && git commit -q -m init && git push -q origin main && git switch -q -c feature \
+  && git worktree add -q .claude/worktrees/agent-a1 -b agent-a1 \
+  && git worktree add -q .claude/worktrees/agent-b2 -b agent-b2 \
+  && echo main-work >> a.txt && echo sub-work > .claude/worktrees/agent-a1/s.txt )
+SA="$T/sa"; SA_A1="$SA/.claude/worktrees/agent-a1"; SA_B2="$SA/.claude/worktrees/agent-b2"
+cp "$T/transcript.jsonl" "$T/sa-transcript.jsonl"
+sa_hook() { # sa_hook <event> <cwd> [agent_id] [session]
+  jq -n --arg e "$1" --arg c "$2" --arg a "${3:-}" --arg s "${4:-sess-sa01}" --arg tp "$T/sa-transcript.jsonl" \
+    '{session_id: $s, hook_event_name: $e, cwd: $c, transcript_path: $tp, permission_mode: "default"}
+     + (if $a == "" then {} else {agent_id: $a, agent_type: "general-purpose"} end)' | "$TOOL" hook
+}
+sa_age() { # sa_age <minutes>: makes the session and its transcript look that old
+  jq --argjson t $(( $(date +%s) - $1 * 60 )) '.last_activity = $t' "$SLEEPWALK_HOME/sessions/sess-sa01.json" > "$T/sa.tmp" \
+    && mv "$T/sa.tmp" "$SLEEPWALK_HOME/sessions/sess-sa01.json"
+  touch -t "$(date -v-"$1"M +%Y%m%d%H%M.%S)" "$T/sa-transcript.jsonl"
+}
+sa_hook UserPromptSubmit "$SA"
+sa_hook PreToolUse "$SA"
+sa_age 25
+sa_hook PreToolUse "$SA_A1" a1a1a1a1
+check "a subagent's tool call keeps the session's folder" [ "$(rec sess-sa01 | jq -r .cwd)" = "$SA" ]
+check "and records the subagent's worktree" [ "$(rec sess-sa01 | jq -c .worktrees)" = "[\"$SA_A1\"]" ]
+check "and counts as activity" [ $(( $(date +%s) - $(rec sess-sa01 | jq .last_activity) )) -lt 60 ]
+sa_hook Stop "$SA_A1" a1a1a1a1
+check "a subagent's Stop does not mark the session idle" [ "$(rec sess-sa01 | jq -r .state)" = busy ]
+sa_hook SessionEnd "$SA_A1" a1a1a1a1
+check "a subagent's SessionEnd does not drop the session" [ -f "$SLEEPWALK_HOME/sessions/sess-sa01.json" ]
+sa_hook PreToolUse "$SA_B2"
+check "without agent_id, a call from an agent worktree of the session's folder is a subagent's" \
+  [ "$(rec sess-sa01 | jq -c '[.cwd, .worktrees]')" = "[\"$SA\",[\"$SA_A1\",\"$SA_B2\"]]" ]
+sa_hook PreToolUse "$SA_A1" a1a1a1a1
+check "worktrees are listed once, most recent last" [ "$(rec sess-sa01 | jq -c .worktrees)" = "[\"$SA_B2\",\"$SA_A1\"]" ]
+sa_hook PreToolUse "$SA_A1" zzzz sess-sa99
+check "a subagent event for an untracked session records nothing" [ ! -f "$SLEEPWALK_HOME/sessions/sess-sa99.json" ]
+
+# A parent waiting on subagents writes nothing to its own transcript; their tool calls
+# keep it eligible past STALE_MINUTES.
+sa_age 25
+SLEEPWALK_LID=closed "$TOOL" sleep --dry-run
+check "a quiet parent with no subagent activity is not handed off" [ ! -f "$SLEEPWALK_HOME/dry-run-brief-sess-sa01.txt" ]
+sa_hook PreToolUse "$SA_A1" a1a1a1a1
+SLEEPWALK_LID=closed "$TOOL" sleep --dry-run
+check "a parent whose subagents are working is handed off" [ -f "$SLEEPWALK_HOME/dry-run-brief-sess-sa01.txt" ]
+check "the brief names the subagent worktree left with uncommitted work" \
+  grep -q "^  - $SA_A1\$" "$SLEEPWALK_HOME/dry-run-brief-sess-sa01.txt"
+check "but not a clean one" sh -c "! grep -q '$SA_B2' '$SLEEPWALK_HOME/dry-run-brief-sess-sa01.txt'"
+check "the log names it too" grep -q "subagent worktree $SA_A1 has uncommitted changes" "$SLEEPWALK_HOME/handoff.log"
+
+SLEEPWALK_LID=closed "$TOOL" sleep
+check "the handoff pushes the session's own tree" [ "$(git -C "$T/sa-origin.git" show feature:a.txt 2>/dev/null | tail -1)" = main-work ]
+check "without committing the agent worktrees into it" \
+  [ -z "$(git -C "$T/sa-origin.git" ls-tree -r --name-only feature -- .claude)" ]
+check "and leaves the subagent's uncommitted work in place" [ "$(git -C "$SA_A1" status --porcelain)" = "?? s.txt" ]
+"$TOOL" release sess-sa01 >/dev/null
+sa_hook SessionEnd "$SA"
+
+# --- WIP commit: nested repositories, agent worktrees and large files ------------------
+# Claude Code puts subagent worktrees in .claude/worktrees/<name>, and people keep other
+# clones inside a checkout. `git add -A` would commit each as a broken gitlink (mode
+# 160000, no .gitmodules); they must stay out of the WIP commit, as must files too big to
+# push. A real submodule already in HEAD keeps working.
+mkrepo sublib
+mkrepo nestrepo
+( cd "$T/nestrepo" && rm w.txt && head -c 1000 /dev/zero > data.bin \
+  && git -c protocol.file.allow=always submodule add -q "$T/sublib.git" lib 2>/dev/null \
+  && git add data.bin && git commit -q -m "add lib" && git push -q origin main \
+  && git worktree add -q .claude/worktrees/agent-x -b agent-x \
+  && git init -q scratch && echo x > scratch/f \
+  && git init -q vendored && echo v > vendored/f && git -C vendored add f && git -C vendored commit -q -m v \
+  && echo lib2 > lib/new.txt && git -C lib add new.txt && git -C lib commit -q -m lib2 \
+  && echo work > w.txt && mkdir docs && echo n > "docs/my notes.txt" \
+  && head -c 2097152 /dev/zero > big.bin && head -c 2097152 /dev/zero > data.bin )
+nest_status() { git -C "$T/nestrepo" status --porcelain | sort | tr '\n' ' '; }
+nest_before="$(nest_status)"
+hook PreToolUse sess-nr01 "$T/nestrepo"
+MAX_FILE_MB=1 SLEEPWALK_LID=closed "$TOOL" sleep --dry-run
+nbrief="$SLEEPWALK_HOME/dry-run-brief-sess-nr01.txt"
+check "dry run: the brief lists the large file left behind" grep -q 'big.bin' "$nbrief"
+check "dry run: the brief lists the nested repositories left behind" sh -c "grep -q '.claude/worktrees/agent-x' '$nbrief' && grep -q 'scratch' '$nbrief'"
+check "dry run: the tree is untouched" [ "$(nest_status)" = "$nest_before" ]
+MAX_FILE_MB=1 SLEEPWALK_LID=closed "$TOOL" sleep
+check "nested repos: the handoff goes through" [ "$(rec sess-nr01 | jq -r .handoff.status)" = cloud ]
+nbr="$(rec sess-nr01 | jq -r .handoff.branch)"
+check "the WIP commit has no gitlink but the real submodule" \
+  [ "$(git -C "$T/nestrepo.git" ls-tree -r "$nbr" | awk '$2 == "commit" { print $4 }')" = lib ]
+check "the real submodule's new commit is in the WIP commit" \
+  [ "$(git -C "$T/nestrepo.git" rev-parse "$nbr:lib")" = "$(git -C "$T/nestrepo/lib" rev-parse HEAD)" ]
+check "small untracked files are in the WIP commit" \
+  sh -c "git -C '$T/nestrepo.git' cat-file -e '$nbr:w.txt' && git -C '$T/nestrepo.git' cat-file -e '$nbr:docs/my notes.txt'"
+check "a large untracked file is left out" sh -c "! git -C '$T/nestrepo.git' cat-file -e '$nbr:big.bin' 2>/dev/null"
+check "a large change to a tracked file is left out" [ "$(git -C "$T/nestrepo.git" cat-file -s "$nbr:data.bin")" = 1000 ]
+check "what was left out stays in the tree, untouched" \
+  [ "$(nest_status)" = " M data.bin ?? .claude/ ?? big.bin ?? scratch/ ?? vendored/ " ]
+check "the agent worktree still works" [ "$(git -C "$T/nestrepo/.claude/worktrees/agent-x" branch --show-current)" = agent-x ]
+check "the commit message lists what was left out" \
+  sh -c "git -C '$T/nestrepo' log -1 --format=%b | grep -q 'big.bin' && git -C '$T/nestrepo' log -1 --format=%b | grep -q 'vendored'"
+check "the cloud brief lists what was left out" sh -c "cat '$SLEEPWALK_HOME'/claude-args-* | tr '\0' '\n' | grep -q 'scratch/'"
+check "the log lists what was left out" grep -q 'left out .claude/worktrees/agent-x/ (a nested git repository)' "$SLEEPWALK_HOME/handoff.log"
+
+# A gitlink staged by hand is taken back out, also when the session runs in a subfolder.
+mkrepo neststaged
+( cd "$T/neststaged" && mkdir src && echo s > src/s.txt && git worktree add -q .claude/worktrees/agent-z -b agent-z \
+  && git add -A 2>/dev/null )
+hook PreToolUse sess-nr03 "$T/neststaged/src"
+SLEEPWALK_LID=closed "$TOOL" sleep
+nbr="$(rec sess-nr03 | jq -r .handoff.branch)"
+check "a hand-staged gitlink: the handoff goes through" [ "$(rec sess-nr03 | jq -r .handoff.status)" = cloud ]
+check "the hand-staged gitlink is not in the WIP commit" [ -z "$(git -C "$T/neststaged.git" ls-tree -r "$nbr" | awk '$2 == "commit"')" ]
+check "files outside the session's subfolder are committed" git -C "$T/neststaged.git" cat-file -e "$nbr:w.txt"
+check "the worktree is left untracked" [ "$(git -C "$T/neststaged" status --porcelain)" = "?? .claude/" ]
+
+# A failed handoff in such a tree puts it back exactly as it was.
+mkrepo nestundo
+( cd "$T/nestundo" && git switch -q -c topic && git push -q origin topic \
+  && git worktree add -q .claude/worktrees/agent-y -b agent-y && git init -q scratch \
+  && head -c 2097152 /dev/zero > big.bin && echo more >> a.txt )
+undo_state() { ( cd "$T/nestundo" && git status --porcelain | sort; git rev-parse HEAD; git branch --show-current; git diff | shasum ); }
+undo_before="$(undo_state)"
+hook PreToolUse sess-nr02 "$T/nestundo"
+CLAUDE_BIN="$T/fake-claude-lost" MAX_FILE_MB=1 SLEEP_BUDGET=10 SLEEPWALK_LID=closed "$TOOL" sleep
+check "nested repos: a failed handoff is recorded" [ "$(rec sess-nr02 | jq -r .handoff.status)" = failed ]
+check "and the tree is exactly as it was" [ "$(undo_state)" = "$undo_before" ]
+check "and the remote branch is back where it was" [ "$(git -C "$T/nestundo.git" rev-parse topic)" = "$(git -C "$T/nestundo" rev-parse HEAD)" ]
+
+# === lid open -> resume ================================================================
+# Wake order, watching the cloud branch, clean output, a failed teleport and no network.
+# Runs in its own home so sessions from the tests above do not join in.
+saved_home="$SLEEPWALK_HOME"
+export SLEEPWALK_HOME="$T/handoff-wake" SLEEPWALK_NETWORK=fake
+mkdir -p "$SLEEPWALK_HOME" && touch "$SLEEPWALK_HOME/net-up"
+cat > "$T/fake-open" <<'EOF'
+#!/bin/bash
+basename "$1" >> "$SLEEPWALK_HOME/opened"
+EOF
+chmod +x "$T/fake-open"
+opened() { cat "$SLEEPWALK_HOME/opened" 2>/dev/null | tr '\n' ' '; }
+wrapups() { cat "$SLEEPWALK_HOME"/claude-args-* | tr '\0' '\n' | grep -c 'The user has opened'; }
+wake() { SLEEPWALK_OPEN="$T/fake-open" SLEEPWALK_LID=open "$TOOL" wake; }
+for r in wake1 wake2 wake3; do
+  mkrepo "$r"
+  jq --arg d "$T/$r" '.projects[$d] = {hasTrustDialogAccepted: true}' "$CLAUDE_CONFIG_FILE" > "$T/c.tmp" && mv "$T/c.tmp" "$CLAUDE_CONFIG_FILE"
+done
+hook PreToolUse sess-wk01 "$T/wake1"
+hook PreToolUse sess-wk02 "$T/wake2"
+SLEEPWALK_LID=closed "$TOOL" sleep
+check "the handoff records the commit it pushed" [ "$(rec sess-wk01 | jq -r .handoff.sha)" = "$(git -C "$T/wake1" rev-parse HEAD)" ]
+
+# Two sessions: one window each, oldest handoff first, after every cloud session is told.
+for s in sess-wk01:100 sess-wk02:200; do
+  f="$SLEEPWALK_HOME/sessions/${s%:*}.json"
+  jq --argjson at "$(( $(date +%s) - ${s#*:} ))" '.handoff.at = $at' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+done
+wake
+check "wake opens one window per session, oldest handoff first" [ "$(opened)" = "resume-sess-wk02.command resume-sess-wk01.command " ]
+check "wake tells each cloud session to wrap up" [ "$(rec sess-wk01 | jq -r .handoff.status) $(rec sess-wk02 | jq -r .handoff.status)" = "returning returning" ]
+check "wake notes where the cloud branch stood" [ "$(rec sess-wk01 | jq -r .handoff.wrapup_sha)" = "$(rec sess-wk01 | jq -r .handoff.sha)" ]
+check "wake leaves no lock behind" [ ! -d "$SLEEPWALK_HOME/wake.lock" ]
+
+# The cloud session pushes while resume waits: resume goes once the branch is quiet.
+br="$(rec sess-wk01 | jq -r .handoff.branch)"
+git clone -q "$T/wake1.git" "$T/cloud1"
+( cd "$T/cloud1" && git switch -q "$br" && echo cloud > cloud.txt && git add cloud.txt \
+  && git commit -q -m "Cloud: finish the fillet tool" )
+( sleep 2; git -C "$T/cloud1" push -q origin "$br" ) &
+t0="$(date +%s)"
+out="$(WRAPUP_WAIT=30 PUSH_QUIET=2 SLEEPWALK_POLL=1 "$TOOL" resume sess-wk01 < /dev/null 2>&1)"
+took=$(( $(date +%s) - t0 ))
+wait
+check "resume goes soon after the cloud push, not after WRAPUP_WAIT" [ "$took" -lt 15 ]
+check "resume lists the cloud session's new commits" sh -c "printf '%s' \"\$1\" | grep -q '^  [0-9a-f]* Cloud: finish the fillet tool\$'" _ "$out"
+check "the header names the repository and branch" sh -c "printf '%s' \"\$1\" | grep -q '^Sleepwalk · wake1\$' && printf '%s' \"\$1\" | grep -q '^  branch  $br\$'" _ "$out"
+check "output that is not a terminal has no escape codes" sh -c "! printf '%s' \"\$1\" | grep -q \"\$(printf '\\033')\"" _ "$out"
+check "resume removes only its own .command file" [ ! -f "$SLEEPWALK_HOME/resume-sess-wk01.command" ] && [ -f "$SLEEPWALK_HOME/resume-sess-wk02.command" ]
+check "resume teleports and marks the session resumed" sh -c "[ \"\$(jq -r .handoff.status '$SLEEPWALK_HOME/sessions/sess-wk01.json')\" = resumed ] && ls '$SLEEPWALK_HOME'/claude-args-* | tail -1 | xargs cat | tr '\0' ' ' | grep -q '^--teleport session_01TEST'"
+check "resume leaves no lock or poll files" sh -c "! ls '$SLEEPWALK_HOME' | grep -q 'lock\|poll'"
+
+# A teleport that fails says what to do next and leaves the session ready to retry.
+out="$(FAKE_TELEPORT_RC=3 WRAPUP_WAIT=1 "$TOOL" resume sess-wk02 < /dev/null 2>&1)"; rc=$?
+check "a failed teleport exits with its code" [ "$rc" = 3 ]
+check "and says how to retry, release or open the web" sh -c "printf '%s' \"\$1\" | grep -q 'resume sess-wk02' && printf '%s' \"\$1\" | grep -q 'release sess-wk02' && printf '%s' \"\$1\" | grep -q 'https://claude.ai/code/session_01TEST'" _ "$out"
+check "the session stays paused, waiting to come back" [ "$(rec sess-wk02 | jq -r .handoff.status)" = returning ]
+told="$(wrapups)"
+rm -f "$SLEEPWALK_HOME/opened"
+wake
+check "the next wake reopens it" [ "$(opened)" = "resume-sess-wk02.command " ]
+check "without messaging the cloud session again" [ "$(wrapups)" = "$told" ]
+rm -f "$SLEEPWALK_HOME/opened"
+mkdir "$SLEEPWALK_HOME/resume-sess-wk02.lock" && echo $$ > "$SLEEPWALK_HOME/resume-sess-wk02.lock/pid"
+wake
+check "a session with a resume window running is left alone" [ -z "$(opened)" ]
+check "a second resume of it refuses" sh -c "! '$TOOL' resume sess-wk02 < /dev/null 2>/dev/null"
+rm -rf "$SLEEPWALK_HOME/resume-sess-wk02.lock"
+WRAPUP_WAIT=1 "$TOOL" resume sess-wk02 < /dev/null > /dev/null 2>&1
+check "a retry brings it back" [ "$(rec sess-wk02 | jq -r .handoff.status)" = resumed ]
+
+# A wrap-up message that does not get through is sent again later.
+hook PreToolUse sess-wk03 "$T/wake3"
+SLEEPWALK_LID=closed "$TOOL" sleep
+rm -f "$SLEEPWALK_HOME/opened"
+CLAUDE_BIN="$T/fake-claude-lost" wake
+check "a session the wrap-up did not reach stays in the cloud" [ "$(rec sess-wk03 | jq -r .handoff.status)" = cloud ]
+
+# No network when the lid opens: resume says so, and wake waits until the Mac is online.
+rm -f "$SLEEPWALK_HOME/net-up" "$SLEEPWALK_HOME/opened"
+out="$(NETWORK_WAIT=1 "$TOOL" resume sess-wk03 < /dev/null 2>&1)"; rc=$?
+check "resume with no network stops with next steps" sh -c "[ $rc = 1 ] && printf '%s' \"\$1\" | grep -q 'Still no network' && printf '%s' \"\$1\" | grep -q 'resume sess-wk03'" _ "$out"
+check "and leaves the session as it was" [ "$(rec sess-wk03 | jq -r .handoff.status)" = cloud ]
+NETWORK_WAIT=1 wake &
+wpid=$!
+sleep 5
+check "with no network, wake keeps waiting past NETWORK_WAIT" kill -0 "$wpid"
+check "and says so in one notification" [ "$(grep -c 'notify: Cloud handoff: No network yet' "$SLEEPWALK_HOME/handoff.log")" = 1 ]
+check "nothing opens while offline" [ -z "$(opened)" ]
+touch "$SLEEPWALK_HOME/net-up"
+for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$wpid" 2>/dev/null || break; sleep 1; done
+kill "$wpid" 2>/dev/null
+check "once online, wake brings the session back" [ "$(opened)" = "resume-sess-wk03.command " ]
+check "and tells the cloud session to wrap up" [ "$(rec sess-wk03 | jq -r .handoff.status)" = returning ]
+
+# On a terminal: a window title and a status line rewritten in place.
+out="$(WRAPUP_WAIT=2 script -q /dev/null "$TOOL" resume sess-wk03 < /dev/null 2>&1)"
+check "on a terminal, resume titles the window after the repository" sh -c "printf '%s' \"\$1\" | grep -q \"\$(printf '\\033]0;Sleepwalk · wake3\\007')\"" _ "$out"
+check "and clears the screen of Terminal's login banner" sh -c "printf '%s' \"\$1\" | grep -q \"\$(printf '\\033\\[2J')\"" _ "$out"
+check "and rewrites one status line in place" sh -c "printf '%s' \"\$1\" | grep -q \"\$(printf '\\r\\033\\[K')Waiting for the cloud session to push\"" _ "$out"
+
+export SLEEPWALK_HOME="$saved_home"
+unset SLEEPWALK_NETWORK
+
+# === state hygiene: pruning, leftover files, log rotation, traps, concurrent writes.
+# Uses its own home, so it neither depends on nor disturbs the tests above.
+H="$T/hygiene"; S="$H/sessions"
+sw() { SLEEPWALK_HOME="$H" "$TOOL" "$@"; }
+hhook() { # hhook <event> <session> [cwd] [transcript]
+  jq -n --arg e "$1" --arg s "$2" --arg c "${3:-$T/repo}" --arg tp "${4:-$T/old.jsonl}" \
+    '{session_id: $s, hook_event_name: $e, cwd: $c, transcript_path: $tp}' | sw hook
+}
+hset() { # hset <session> <jq filter>: edits a record by hand
+  jq --argjson now "$(date +%s)" "$2" "$S/$1.json" > "$S/$1.edit" && mv "$S/$1.edit" "$S/$1.json"
+}
+hhas() { [ -f "$S/$1.json" ]; }
+echo old > "$T/old.jsonl"
+touch -t "$(date -v-30d +%Y%m%d%H%M.%S)" "$T/old.jsonl"
+mkdir -p "$H"; : > "$H/last-prune"   # hold off the hourly prune until it is under test
+
+# --- prune: resumed sessions go after RESUMED_KEEP_HOURS, quiet ones after PRUNE_DAYS.
+for s in st-res-old st-res-new st-quiet st-live st-notp st-cloud-new st-cloud-old; do hhook SessionStart "$s"; done
+hset st-res-old '.state = "busy" | .handoff = {status: "resumed", cloud_id: "x", at: ($now - 90000), resumed_at: ($now - 90000)}'
+hset st-res-new '.state = "busy" | .handoff = {status: "resumed", cloud_id: "x", at: ($now - 3600), resumed_at: ($now - 3600)}'
+hset st-quiet '.last_activity = ($now - 8 * 86400)'
+hset st-notp ".last_activity = (\$now - 2 * 86400) | .transcript_path = \"$T/no-such.jsonl\""
+hset st-cloud-new '.last_activity = ($now - 3 * 86400) | .handoff = {status: "cloud", cloud_id: "x", at: ($now - 3 * 86400)}'
+hset st-cloud-old '.last_activity = ($now - 8 * 86400) | .handoff = {status: "returning", cloud_id: "x", at: ($now - 8 * 86400)}'
+touch "$H/resume-st-res-old.command" "$H/resume-st-cloud-new.command"
+out="$(sw prune)"
+check "prune forgets a session teleported back over a day ago" sh -c "[ ! -f '$S/st-res-old.json' ] && [ ! -f '$H/resume-st-res-old.command' ]"
+check "prune keeps one teleported back an hour ago" hhas st-res-new
+check "prune forgets a session quiet for 8 days" [ ! -f "$S/st-quiet.json" ]
+check "prune forgets a quiet session whose transcript is gone" [ ! -f "$S/st-notp.json" ]
+check "prune keeps an active session" hhas st-live
+check "prune keeps a recent cloud handoff and its .command" sh -c "[ -f '$S/st-cloud-new.json' ] && [ -f '$H/resume-st-cloud-new.command' ]"
+check "prune forgets a handoff never resumed in 8 days" [ ! -f "$S/st-cloud-old.json" ]
+check "prune says how many it forgot" [ "$out" = "Pruned 4 session record(s)." ]
+check "prune logs each record it forgets" grep -q 'pruned st-res-old: teleported back' "$H/handoff.log"
+
+# --- orphaned resume .command files go on release, SessionEnd, prune, and after a day.
+touch "$H/resume-st-gone.command" "$H/resume-st-res-new.command"
+touch -t "$(date -v-2d +%Y%m%d%H%M.%S)" "$H/resume-st-cloud-new.command"
+sw prune >/dev/null
+check "prune removes a .command with no record" [ ! -f "$H/resume-st-gone.command" ]
+check "prune removes a .command for a session no longer in the cloud" [ ! -f "$H/resume-st-res-new.command" ]
+check "prune removes a .command unused for a day" [ ! -f "$H/resume-st-cloud-new.command" ]
+check "but keeps the cloud session's record" hhas st-cloud-new
+touch "$H/resume-st-cloud-new.command"
+sw release st-cloud-new >/dev/null
+check "release removes the session's .command" [ ! -f "$H/resume-st-cloud-new.command" ]
+touch "$H/resume-st-live.command"
+hhook SessionEnd st-live
+check "SessionEnd removes the session's .command" [ ! -f "$H/resume-st-live.command" ]
+
+# --- prune clears files left by killed processes, but not fresh ones.
+touch -t "$(date -v-1H +%Y%m%d%H%M.%S)" "$S/st-x.json.123.tmp"
+mkdir "$S/st-x.json.lock"; touch -t "$(date -v-1H +%Y%m%d%H%M.%S)" "$S/st-x.json.lock"
+touch "$S/st-y.json.456.tmp"
+sw prune >/dev/null
+check "prune removes an old temporary record" [ ! -f "$S/st-x.json.123.tmp" ]
+check "prune removes an old record lock" [ ! -d "$S/st-x.json.lock" ]
+check "prune leaves a fresh temporary record" [ -f "$S/st-y.json.456.tmp" ]
+rm -f "$S/st-y.json.456.tmp"
+
+# --- the hourly prune runs from SessionStart, not from every tool call.
+hhook SessionStart st-stale; hset st-stale '.last_activity = ($now - 8 * 86400)'
+hhook PreToolUse st-other
+touch -t "$(date -v-2H +%Y%m%d%H%M.%S)" "$H/last-prune"
+hhook PreToolUse st-other
+check "PreToolUse does not prune" hhas st-stale
+out="$(hhook SessionStart st-other)"
+check "SessionStart prunes once the last prune is an hour old" [ ! -f "$S/st-stale.json" ]
+check "and says nothing to Claude about it" [ -z "$out" ]
+hhook SessionStart st-stale; hset st-stale '.last_activity = ($now - 8 * 86400)'
+hhook SessionStart st-other
+check "it prunes at most once an hour" hhas st-stale
+
+# --- logs rotate past LOG_MAX_KB.
+head -c 3000 /dev/zero | tr '\0' x > "$H/handoff.log"
+head -c 3000 /dev/zero | tr '\0' x > "$H/sleepwatch.log"
+LOG_MAX_KB=2 DEBUG=1 hhook Stop st-other
+check "handoff.log moves to handoff.log.1 past the limit" sh -c "[ \$(wc -c < '$H/handoff.log.1') -ge 3000 ] && [ \$(wc -c < '$H/handoff.log') -lt 200 ]"
+check "the new log carries on" grep -q 'hook Stop st-other' "$H/handoff.log"
+LOG_MAX_KB=2 sw prune >/dev/null
+check "prune rotates sleepwatch.log in place" sh -c "[ -f '$H/sleepwatch.log.1' ] && [ ! -s '$H/sleepwatch.log' ]"
+
+# --- records survive bad input and concurrent writers.
+printf '{"session_id": ' > "$S/st-bad.json"
+: > "$S/st-empty.json"
+hhook UserPromptSubmit st-bad; hhook UserPromptSubmit st-empty
+check "an unreadable record starts afresh" [ "$(jq -r .state "$S/st-bad.json")" = busy ]
+check "an empty record starts afresh" [ "$(jq -r .state "$S/st-empty.json")" = busy ]
+check "no temporary records are left behind" [ -z "$(find "$S" -name '*.tmp' -o -name '*.lock')" ]
+for i in 1 2 3 4 5 6 7 8; do
+  SLEEPWALK_HOME="$H" bash -c '. "$1" help >/dev/null; update_rec st-conc --arg k "$2" ".[\$k] = 1"' _ "$TOOL" "k$i" &
+done
+wait
+check "concurrent writes to one record all land" [ "$(jq 'keys | length' "$S/st-conc.json")" = 8 ]
+hhook SessionEnd st-bad; hhook SessionEnd st-empty; rm -f "$S/st-conc.json"
+
+# --- sleep skips sessions whose folder is gone instead of using its own folder.
+hhook PreToolUse st-nocwd "$T/vanished"
+hhook PreToolUse st-emptycwd; hset st-emptycwd '.cwd = ""'
+n0="$(find "$H" -maxdepth 1 -name 'claude-args-*' | wc -l | tr -d ' ')"
+( cd "$T/repo" && SLEEPWALK_LID=closed SLEEPWALK_HOME="$H" "$TOOL" sleep )
+check "sleep skips a session whose folder is gone" grep -q 'skip st-nocwd: working directory .*vanished is gone' "$H/handoff.log"
+check "and one with no folder at all" grep -q 'skip st-emptycwd: working directory (none) is gone' "$H/handoff.log"
+check "neither starts a cloud session" [ "$(find "$H" -maxdepth 1 -name 'claude-args-*' | wc -l | tr -d ' ')" = "$n0" ]
+hhook SessionEnd st-nocwd; hhook SessionEnd st-emptycwd
+
+# --- traps: set once, never inside a function, and safe when the step is stopped.
+check "no trap is set inside a function" sh -c "! grep -nE '^[[:space:]]+trap ' '$TOOL'"
+err="$(SLEEPWALK_LID=open sw wake 2>&1)"
+check "wake leaves no lock and no errors" sh -c "[ -z \"\$1\" ] && [ ! -d '$H/wake.lock' ]" _ "$err"
+mkrepo hygrepo
+hhook PreToolUse st-term "$T/hygrepo"
+CLAUDE_BIN="$T/fake-claude-lost" SLEEP_BUDGET=15 SLEEPWALK_LID=closed SLEEPWALK_HOME="$H" "$TOOL" sleep 2> "$T/term.err" &
+p=$!
+sleep 3; kill -TERM "$p"; wait "$p" 2>/dev/null; sleep 1
+check "a stopped sleep step reports no errors" [ ! -s "$T/term.err" ]
+check "a stopped sleep step removes its temporary file" sh -c "! ls '$H' | grep -q sleep-candidates"
+check "a stopped sleep step stops its handoffs" sh -c "! pgrep -f '$T/fake-claude-lost' >/dev/null"
 
 echo
 [ "$fails" = 0 ] && echo "all tests passed" || { echo "$fails failed"; exit 1; }
