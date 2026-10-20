@@ -39,7 +39,7 @@ NETWORKSETUP="${NETWORKSETUP:-/usr/sbin/networksetup}"  # where Claude Code keep
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-WRAPUP_MSG='The user has opened their laptop again and will continue this session locally. Stop starting new work. Commit everything you have (tests may be failing; say so in the commit message), push the branch, and then reply with a short summary of what you did and what is left.'
+WRAPUP_MSG='The user has opened their laptop again and will continue this session there. Stop starting new work. Commit everything (if tests fail, say so in the commit message) and push the branch. Then end with a short summary for the user: what you did, what is left, and any decisions you made for them.'
 
 die() { echo "sleepwalk: $*" >&2; exit 1; }
 
@@ -200,28 +200,102 @@ EOF
 }
 
 # --- brief --------------------------------------------------------------------------
-# Builds the cloud agent's instructions from the session transcript: the original
-# request, then the most recent conversation, trimmed to BRIEF_CHARS.
+# Builds the cloud agent's instructions from the session transcript (Claude Code's JSONL;
+# a half-written last line is skipped): the original request, the recent conversation,
+# the latest task list, and the last tool calls with whether each one finished. Sleepwalk's
+# own SessionStart notes, and Claude's replies relaying them, are left out: they are about
+# the laptop and mean nothing in the cloud. The whole excerpt stays within BRIEF_CHARS.
+# shellcheck disable=SC2016 # a jq program, not shell
+BRIEF_JQ='
+def clip($n): if length > $n then .[0:$n - 3] + "..." else . end;
+def oneline: gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; "");
+def ownnote: test("sleepwalk trust|/sleepwalk:install|sleep watcher is not installed|^\\s*Sleepwalk:"; "i");
+def texts: (if type == "string" then [.] else [.[]? | select(.type == "text") | .text] end)
+  | map(select(test("^\\s*<") | not) | split("\n\n") | map(select(ownnote | not)) | join("\n\n"))
+  | join("\n");
+def rawtext: if type == "string" then . elif type == "array" then [.[]? | select(.type? == "text") | .text] | join("\n") else "" end;
+def listtool: .name | test("^(TodoWrite|TaskCreate|TaskUpdate|mcp__ccd_turn__update_plan)$");
+def hidden: listtool or (.name | test("^(TaskList|TaskGet|mcp__ccd_(turn|session)__.*)$"));
+def summary: (.input // {}) as $i
+  | (if .name == "Bash" then ($i.command // "" | tostring) + (if $i.run_in_background == true then " (in the background)" else "" end)
+     elif ($i.file_path // $i.notebook_path) then ($i.file_path // $i.notebook_path)
+     elif $i.pattern then ($i.pattern | tostring) + (if $i.path then " in \($i.path)" else "" end)
+     elif ($i.url // $i.query // $i.description // $i.skill) then ($i.url // $i.query // $i.description // $i.skill)
+     elif $i == {} then ""
+     else $i end) | tostring | oneline | clip(150);
+
+[inputs | fromjson? | objects] as $all
+| [$all[] | select((.type == "user" or .type == "assistant") and (.isSidechain != true))] as $chain
+| [$chain[] | select(.isMeta != true)
+    | {who: (if .type == "user" then "USER" else "CLAUDE" end), text: (.message.content | texts)}
+    | select(.text | test("\\S"))] as $m
+| [$chain[] | select(.type == "assistant") | .message.content[]? | select(.type? == "tool_use")] as $calls
+| (reduce ($chain[] | select(.type == "user") | . as $e | .message.content[]? | select(.type? == "tool_result")
+      | {id: .tool_use_id, err: (.is_error == true), text: (.content | rawtext), extra: $e.toolUseResult})
+    as $r ({}; .[$r.id] = $r)) as $res
+| (reduce ($all[] | .message.content?, .content?, .attachment.prompt? | rawtext
+      | scan("<task-notification>[\\s\\S]*?</task-notification>"))
+    as $n ({}; ([$n | capture("<tool-use-id>(?<id>[^<]+)</tool-use-id>").id] | first) as $id
+      | if $id then .[$id] = ([$n | capture("<status>(?<s>[^<]+)</status>").s] | first // "finished") else . end)) as $bg
+| (reduce ($calls[] | select(listtool) | select(($res[.id].err // false) | not)) as $c ([];
+    ($c.input // {}) as $in
+    | if $c.name == "TodoWrite" then [$in.todos[]? | {content, status}]
+      elif $c.name == "TaskCreate" then
+        . + [{id: (([$res[$c.id].extra.task.id?] | first)
+                   // ([$res[$c.id].text // "" | capture("#(?<n>[0-9]+)").n] | first)
+                   // (length + 1)) | tostring,
+              content: $in.subject, status: "pending"}]
+      elif $c.name == "TaskUpdate" then
+        map(if .id == ($in.taskId | tostring)
+            then (if $in.status then .status = $in.status else . end)
+               | (if $in.subject then .content = $in.subject else . end)
+            else . end) | map(select(.status != "deleted"))
+      elif $in.items then [$in.items[]? | {content, status}]
+      else
+        (if $in.advance == true then
+           ([to_entries[] | select(.value.status == "in_progress") | .key] | first) as $i
+           | (if $i != null then .[$i].status = "completed" else . end)
+           | ([to_entries[] | select(.value.status == "pending") | .key] | first) as $j
+           | (if $j != null then .[$j].status = "in_progress" else . end)
+         else . end)
+        | reduce ($in.done // [])[] as $d (.; if $d >= 1 and $d <= length then .[$d - 1].status = "completed" else . end)
+        | (($in.start // 0) as $s | if $s >= 1 and $s <= length then .[$s - 1].status = "in_progress" else . end)
+      end)) as $todos
+| ($calls | map(select(hidden | not))) as $work
+| ($work[-8:] | map(
+    $res[.id] as $r
+    | (if $r == null then "NO RESULT: still running (or waiting for permission) when the laptop slept"
+       elif $r.err then "error: " + ($r.text | gsub("</?tool_use_error>"; "") | oneline | clip(120))
+       elif $bg[.id] then "ran in the background: " + $bg[.id]
+       elif ($r.text | test("^(Command running in background|Async agent launched)")) then
+         "started in the background and still running when the laptop slept; its output is lost"
+       else "done" end) as $state
+    | "- " + .name + (summary | if . == "" then "" else ": " + . end) + "  [" + $state + "]")
+  | join("\n")) as $doing
+| ($todos[-30:] | map("- [\(.status)] \(.content // "" | tostring | oneline | clip(200))") | join("\n")) as $list
+| ($m | map(select(.who == "USER")) | first | .text // "" | .[0:3000]) as $first
+| ($m[-30:] | map("\(.who): \(.text | .[0:2000])") | join("\n\n")) as $recent
+| (if $list == "" then "" else "\n\nTASK LIST (latest state in the local session):\n" + $list end) as $listpart
+| (if $doing == "" then "" else
+    "\n\nWHAT THE LOCAL SESSION WAS DOING (its last \($work[-8:] | length) of \($work | length) tool calls, oldest first). "
+    + "Check the repository before repeating any of them:\n" + $doing end) as $doingpart
+| ([$max - ($first + $listpart + $doingpart | length) - 200, 1000] | max) as $room
+| "ORIGINAL REQUEST:\n\($first)\n\nRECENT CONVERSATION (oldest first, may be cut at the start):\n\($recent | .[-$room:])"
+  + $listpart + $doingpart
+'
+
 make_brief() {
   local transcript="$1" branch="$2" excerpt
-  excerpt="$(jq -rs --argjson max "$BRIEF_CHARS" '
-    def texts: if type == "string" then [.]
-      else [.[]? | select(.type == "text") | .text] end
-      | map(select(test("^\\s*<") | not)) | join("\n") ;
-    [ .[] | select((.type == "user" or .type == "assistant") and (.isMeta != true) and (.isSidechain != true))
-      | {who: (if .type == "user" then "USER" else "CLAUDE" end), text: (.message.content | texts)}
-      | select(.text | test("\\S")) ] as $m
-    | ($m | map(select(.who == "USER")) | first | .text // "" | .[0:3000]) as $first
-    | ($m[-30:] | map("\(.who): \(.text | .[0:2000])") | join("\n\n")) as $recent
-    | "ORIGINAL REQUEST:\n\($first)\n\nRECENT CONVERSATION (oldest first, may be cut at the start):\n\($recent | .[-$max:])"
-  ' "$transcript" 2>/dev/null)"
+  excerpt="$(jq -nrR --argjson max "$BRIEF_CHARS" "$BRIEF_JQ" "$transcript" 2>/dev/null)"
   [ -n "$excerpt" ] || excerpt="(The local transcript could not be read; work from the repository and the latest commits.)"
   cat <<EOF
-You are taking over a Claude Code session that was running on the user's laptop. The laptop went to sleep, so the session was handed to you automatically by sleepwalk. The user is away and cannot answer questions; make reasonable decisions and note them.
+You are taking over a Claude Code session from the user's laptop, which went to sleep in the middle of a task, so Sleepwalk handed the session to you. The user is away and cannot answer questions: make reasonable decisions, note them, and keep going.
 
-The branch $branch holds the local work, including a final "WIP: hand off to cloud" commit with whatever was uncommitted. Follow the repository's CLAUDE.md or AGENTS.md.
+The branch $branch holds the local work; its last commit, "WIP: hand off to cloud", has whatever was uncommitted. Work on it and stay on it: the user will bring this session back with \`claude --teleport\`, which checks out the session's branch. Follow the repository's CLAUDE.md or AGENTS.md.
 
-Continue the task where the local session left off. Commit and push small, working steps often, because the user may come back at any moment and pull your branch back to the laptop. If you receive a message saying the user is back, commit and push everything, then stop.
+Continue where the local session stopped. Commit small, working steps often, and push each with \`git push -u <remote> HEAD\` to the remote this environment set up (see \`git remote -v\`; it may not be called origin). If there is no remote or the push is refused, do not add a remote or change git settings: keep committing, and say so in your summary.
+
+When a message says the user is back: stop, commit everything, push, and end with a short summary for the user: what you did, what is left, and any decisions you made for them.
 
 $excerpt
 EOF

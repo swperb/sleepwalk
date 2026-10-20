@@ -304,5 +304,64 @@ check "install --plugin adds no settings hooks" [ "$(jq '[.hooks[][] .hooks[] | 
 check "install --plugin still writes the launch agent" [ -f "$SLEEPWALK_PLIST" ]
 check "SessionStart is quiet once installed" [ -z "$(hook SessionStart sess-gggg7777)" ]
 
+# --- the cloud brief: what was in flight, the task list, and no Sleepwalk notes. -------
+# A synthetic transcript in the shapes Claude Code writes: a SessionStart hook attachment,
+# tool_use / tool_result pairs, a background Bash whose completion arrives as a
+# <task-notification> queue operation, a blocked call, TodoWrite plus a desktop-app plan
+# step and Task tools, a call with no result yet, and a half-written last line.
+mkrepo briefrepo
+BT="$T/brief-transcript.jsonl"
+{
+  echo '{"type":"user","message":{"role":"user","content":"Run the migration in four steps, then write NOTES.md"}}'
+  echo '{"type":"attachment","attachment":{"type":"hook_success","hookName":"SessionStart:startup","hookEvent":"SessionStart","content":"Sleepwalk: Claude Code trusts /x only through /. Ask the user. If they agree, run: sleepwalk trust \"/x\""}}'
+  echo '{"type":"user","message":{"role":"user","content":"Sleepwalk is enabled but its sleep watcher is not installed, so nothing will be handed off when the lid closes."}}'
+  for i in A B C; do
+    jq -nc --arg t "FILLER-$i $(printf 'x%.0s' $(seq 1 1500))" '{type:"assistant",message:{content:[{type:"text",text:$t}]}}'
+  done
+  for i in 0 1 2 3 4; do
+    echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r'$i'","name":"Read","input":{"file_path":"/repo/early'$i'.txt"}}]}}'
+    echo '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"r'$i'","content":"ok"}]}}'
+  done
+  cat <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"text","text":"Starting the migration."},{"type":"tool_use","id":"t0","name":"TodoWrite","input":{"todos":[{"content":"Step 1","status":"completed","activeForm":"a"},{"content":"Step 2","status":"in_progress","activeForm":"b"},{"content":"Step 3","status":"pending","activeForm":"c"},{"content":"Write NOTES.md","status":"pending","activeForm":"d"}]}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t0","content":"Todos updated"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"make step1","description":"Step 1"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"step 1 ok","is_error":false}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"make step2","run_in_background":true}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"Command running in background with ID: b1. Output is being written to: /tmp/b1.output"}]}}
+{"type":"queue-operation","operation":"enqueue","content":"<task-notification>\n<task-id>b1</task-id>\n<tool-use-id>t2</tool-use-id>\n<status>completed</status>\n<summary>Background command completed (exit code 0)</summary>\n</task-notification>"}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"p1","name":"mcp__ccd_turn__update_plan","input":{"advance":true}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"p1","content":"ok"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"k1","name":"TaskCreate","input":{"subject":"Tidy up","description":"d"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"k1","content":"Task #7 created successfully: Tidy up"}]},"toolUseResult":{"task":{"id":"7","subject":"Tidy up"}}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"k2","name":"TaskUpdate","input":{"taskId":"7","status":"in_progress"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"k2","content":"Updated task #7 status"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"make step3"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t3","content":"<tool_use_error>Blocked: nope</tool_use_error>","is_error":true}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Step 3 was blocked; retrying.\n\nSeparately: Sleepwalk found this folder is only trusted through a parent. Do you want me to run `sleepwalk trust \"/x\"`?"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t5","name":"Write","input":{"file_path":"/repo/NOTES.md","content":"notes"}}]}}
+{"type":"assistant","mess
+EOF
+} > "$BT"
+jq -n --arg tp "$BT" --arg c "$T/briefrepo" '{session_id: "sess-brief01", hook_event_name: "PreToolUse", cwd: $c, transcript_path: $tp}' | "$TOOL" hook
+BRIEF_CHARS=3000 SLEEPWALK_LID=closed "$TOOL" sleep --dry-run
+bf="$SLEEPWALK_HOME/dry-run-brief-sess-brief01.txt"
+bhas() { grep -qF -- "$1" "$bf"; }
+check "brief: a finished call is marked done" bhas '- Bash: make step1  [done]'
+check "brief: a background call that completed says so" bhas '- Bash: make step2 (in the background)  [ran in the background: completed]'
+check "brief: a refused call shows its error" bhas '- Bash: make step3  [error: Blocked: nope]'
+check "brief: a call with no result was still running" bhas '- Write: /repo/NOTES.md  [NO RESULT: still running'
+check "brief: only the last 8 tool calls are listed" sh -c "grep -qF 'last 8 of 9 tool calls' '$bf' && ! grep -q 'early0' '$bf' && grep -q 'early1' '$bf'"
+check "brief: task-list tools are not listed as work" sh -c "! grep -qE '^- (TodoWrite|TaskCreate|TaskUpdate|mcp__ccd_turn__update_plan)' '$bf'"
+check "brief: the task list has the latest state" sh -c "sed -n '/^TASK LIST/,/^\$/p' '$bf' | tr '\n' '|' | grep -qF -- '- [completed] Step 1|- [completed] Step 2|- [in_progress] Step 3|- [pending] Write NOTES.md|- [in_progress] Tidy up|'"
+check "brief: Sleepwalk's own notes and relays are dropped" sh -c "! grep -qiE 'sleepwalk trust|sleep watcher is not installed' '$bf'"
+check "brief: the rest of that reply is kept" bhas 'CLAUDE: Step 3 was blocked; retrying.'
+check "brief: the excerpt stays within BRIEF_CHARS" [ "$(sed -n '/^ORIGINAL REQUEST:/,$p' "$bf" | wc -c | tr -d ' ')" -le 3000 ]
+check "brief: a long conversation is cut at its start" sh -c "grep -q 'FILLER-C' '$bf' && ! grep -q 'FILLER-A' '$bf'"
+check "brief: git push uses the environment's remote, not origin" sh -c "grep -qF 'git push -u <remote> HEAD' '$bf' && grep -qF 'git remote -v' '$bf' && grep -qF 'claude --teleport' '$bf' && ! grep -qE 'git push [^<]*origin' '$bf'"
+check "brief: says how to wrap up for the user" bhas 'end with a short summary for the user: what you did, what is left, and any decisions you made for them'
+check "wrap-up message asks for a summary for the user" sh -c "cat '$SLEEPWALK_HOME'/claude-args-* | tr '\0' '\n' | grep -q 'any decisions you made for them'"
+hook SessionEnd sess-brief01 "$T/briefrepo"
+
 echo
 [ "$fails" = 0 ] && echo "all tests passed" || { echo "$fails failed"; exit 1; }
