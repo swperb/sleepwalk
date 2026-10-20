@@ -302,7 +302,7 @@ chmod +x "$T/fakebin/open" "$T/fakebin/osascript"
 mkrepo sim
 jq --arg d "$T/sim" '.projects[$d] = {hasTrustDialogAccepted: true}' "$CLAUDE_CONFIG_FILE" > "$T/c.tmp" && mv "$T/c.tmp" "$CLAUDE_CONFIG_FILE"
 for f in "$SLEEPWALK_HOME"/sessions/*.json; do hook Stop "$(basename "$f" .json)" >/dev/null; done
-sim() { PATH="$T/fakebin:$PATH" SLEEPWALK_NETWORK=fake SLEEPWALK_LID= "$TOOL" simulate "$@" < /dev/null; }
+sim() { PATH="$T/fakebin:$PATH" SLEEPWALK_NETWORK=fake SLEEPWALK_LID='' "$TOOL" simulate "$@" < /dev/null; }
 touch "$SLEEPWALK_HOME/net-up"
 
 out="$(sim --nap 0)"
@@ -317,7 +317,7 @@ check "simulate reports the cloud link" sh -c "printf '%s' \"\$1\" | grep -q 'se
 check "the session running the rehearsal sits it out" [ "$(rec sess-self | jq -r '.handoff.status // "none"')" = none ]
 check "the wake step opens the resume terminal" grep -q "resume-sess-sim1.command" "$SLEEPWALK_HOME/opened"
 check "simulate leaves no override behind" [ ! -f "$SLEEPWALK_HOME/simulate" ]
-SLEEPWALK_LID= "$TOOL" sleep
+SLEEPWALK_LID='' "$TOOL" sleep
 check "and the real lid is read again" sh -c "tail -1 '$SLEEPWALK_HOME/handoff.log' | grep -q 'sleep with the lid open'"
 hook SessionEnd sess-self
 
@@ -341,7 +341,7 @@ printf 'SIM_LID=closed\n' > "$SLEEPWALK_HOME/simulate"
 touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$SLEEPWALK_HOME/simulate"
 hook PreToolUse sess-sim2 "$T/sim"
 SLEEPWALK_LID=open "$TOOL" sleep
-SLEEPWALK_LID= "$TOOL" sleep
+SLEEPWALK_LID='' "$TOOL" sleep
 check "a stale override does not close the lid" [ "$(rec sess-sim2 | jq -r '.handoff.status // "none"')" = none ]
 rm -f "$SLEEPWALK_HOME/simulate"
 hook SessionEnd sess-sim2
