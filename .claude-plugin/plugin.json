@@ -3,7 +3,7 @@
   "version": "0.1.4",
   "description": "Close the lid, Claude keeps working. Hands busy Claude Code sessions to Claude Code on the web when your Mac sleeps, and teleports them back when it wakes.",
   "author": {
-    "name": "Stephen Proctor",
+    "name": "Jay Proctor",
     "url": "https://github.com/swperb"
   },
   "homepage": "https://github.com/swperb/sleepwalk",

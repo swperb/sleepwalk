@@ -2,7 +2,7 @@
   "name": "sleepwalk",
   "description": "Sleepwalk: hand busy Claude Code sessions to the cloud when your Mac sleeps.",
   "owner": {
-    "name": "Stephen Proctor",
+    "name": "Jay Proctor",
     "url": "https://github.com/swperb"
   },
   "plugins": [
