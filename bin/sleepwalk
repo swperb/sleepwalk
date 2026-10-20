@@ -30,6 +30,9 @@ TERMINAL_APP="${TERMINAL_APP:-Terminal}" # the app that opens the resume .comman
 BRIEF_CHARS="${BRIEF_CHARS:-12000}" # size limit for the conversation excerpt in the cloud brief
 HOTSPOT_SSID="${HOTSPOT_SSID:-}" # Wi-Fi to join when there is no network at sleep or wake (an iPhone hotspot)
 HOTSPOT_WAIT="${HOTSPOT_WAIT:-10}" # seconds to wait for the network after joining it
+PRUNE_DAYS="${PRUNE_DAYS:-7}"     # forget sessions with no activity for this many days
+RESUMED_KEEP_HOURS="${RESUMED_KEEP_HOURS:-24}" # forget a session this long after it was teleported back
+LOG_MAX_KB="${LOG_MAX_KB:-1024}"  # past this size a log moves to <log>.1 and starts afresh
 DEBUG="${DEBUG:-0}"           # 1: log every hook event (to see which events Claude Code sends)
 CLAUDE_BIN="${CLAUDE_BIN:-}"
 CLAUDE_CONFIG_FILE="${CLAUDE_CONFIG_FILE:-$HOME/.claude.json}"
@@ -45,10 +48,50 @@ die() { echo "sleepwalk: $*" >&2; exit 1; }
 
 log() {
   mkdir -p "$HANDOFF_HOME"
+  rotate_log "$LOG"
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"
 }
 
+# rotate_log <file>: once the file passes LOG_MAX_KB, keeps it as <file>.1 and empties
+# it. Copies and truncates rather than moving, so a process that holds the log open
+# (launchd's sleepwatch.log) carries on writing to the fresh one.
+rotate_log() {
+  local size
+  size="$(stat -f %z "$1" 2>/dev/null)" || return 0
+  [ "$size" -gt $((LOG_MAX_KB * 1024)) ] || return 0
+  cp "$1" "$1.1" 2>/dev/null && : > "$1"
+}
+
 now() { date +%s; }
+
+# Temporary files, lock folders and child processes to clean up however the script ends.
+# The traps are set once, here, and read only these globals: a trap that names a
+# function's local variable fails under set -u once the function has returned.
+CLEANUP_PATHS=""
+CLEANUP_PIDS=""
+cleanup_add() { CLEANUP_PATHS="$CLEANUP_PATHS$1
+"; }
+# stop_pid <pid>: stops a process and everything under it. A whole tree, because
+# expect(1) runs claude in a session of its own that does not always die with expect.
+stop_pid() {
+  local c
+  kill -STOP "$1" 2>/dev/null   # so it starts nothing new while its children go
+  for c in $(pgrep -P "$1" 2>/dev/null); do stop_pid "$c"; done
+  kill "$1" 2>/dev/null; kill -CONT "$1" 2>/dev/null
+}
+cleanup() {
+  local p
+  for p in $CLEANUP_PIDS; do stop_pid "$p"; done
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if [ -d "$p" ]; then rmdir "$p" 2>/dev/null; else rm -f "$p"; fi
+  done <<EOF
+$CLEANUP_PATHS
+EOF
+  CLEANUP_PATHS=""; CLEANUP_PIDS=""
+}
+trap cleanup EXIT
+trap 'exit 1' TERM INT HUP   # exit runs the EXIT trap
 
 claude_bin() {
   if [ -n "$CLAUDE_BIN" ]; then echo "$CLAUDE_BIN"; return; fi
@@ -61,13 +104,27 @@ rec() { echo "$SESSIONS/$1.json"; }
 
 # update_rec <session-id> [jq options...] <filter>: applies a jq filter to the session's
 # record, creating it if needed. Writes through a temporary file so readers never see a
-# half-written record.
+# half-written record, and holds a lock so that a hook and a handoff writing at the same
+# moment cannot undo each other's change. A missing, empty or unreadable record starts
+# afresh; a failed write leaves the record as it was.
 update_rec() {
-  local f tmp
+  local f tmp lock i=0 rc=0
   f="$(rec "$1")"; shift
   mkdir -p "$SESSIONS"
-  tmp="$f.$$.tmp"
-  if [ -f "$f" ]; then jq "$@" "$f" > "$tmp"; else jq -n "$@" > "$tmp"; fi && mv "$tmp" "$f"
+  tmp="$f.$$.tmp"; lock="$f.lock"
+  # Wait up to about two seconds; a lock older than that was left by a process that died.
+  until mkdir "$lock" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -ge 20 ] && { rmdir "$lock" 2>/dev/null; mkdir "$lock" 2>/dev/null; break; }
+    sleep 0.1
+  done
+  if [ -s "$f" ] && jq "$@" "$f" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then :
+  elif jq -n "$@" > "$tmp" && [ -s "$tmp" ]; then :
+  else rc=1; fi
+  if [ "$rc" = 0 ]; then mv "$tmp" "$f" || rc=1; fi
+  rm -f "$tmp"
+  rmdir "$lock" 2>/dev/null
+  return "$rc"
 }
 
 field() { jq -r "$2 // empty" "$1" 2>/dev/null; }
@@ -153,8 +210,10 @@ cmd_trust() {
 cmd_hook() {
   local input sid event cwd transcript f status url t
   input="$(cat)"
-  IFS=$'\t' read -r sid event cwd transcript <<EOF
-$(printf '%s' "$input" | jq -r '[.session_id // "", .hook_event_name // "", .cwd // "", .transcript_path // ""] | @tsv' 2>/dev/null)
+  # Split on the unit separator, not a tab: read merges runs of tabs, so an empty field
+  # would shift the ones after it.
+  IFS=$'\037' read -r sid event cwd transcript <<EOF
+$(printf '%s' "$input" | jq -r '[.session_id // "", .hook_event_name // "", .cwd // "", .transcript_path // ""] | join("\u001f")' 2>/dev/null)
 EOF
   [ -n "${sid:-}" ] || return 0
   # Sleepwalk's own claude calls (creating and messaging cloud sessions) run with
@@ -186,7 +245,8 @@ EOF
       [ -f "$PLIST" ] || echo "Sleepwalk is enabled but its sleep watcher is not installed, so nothing will be handed off when the lid closes. Suggest the user run /sleepwalk:install."
       trust_hint "$cwd"
       update_rec "$sid" --arg sid "$sid" --arg cwd "$cwd" --arg tp "$transcript" --argjson t "$t" \
-        '.session_id = $sid | .cwd = $cwd | .transcript_path = $tp | .state = (.state // "idle") | .last_activity = $t' ;;
+        '.session_id = $sid | .cwd = $cwd | .transcript_path = $tp | .state = (.state // "idle") | .last_activity = $t'
+      maybe_prune ;;
     UserPromptSubmit|PreToolUse)
       update_rec "$sid" --arg sid "$sid" --arg cwd "$cwd" --arg tp "$transcript" --argjson t "$t" \
         '.session_id = $sid | .cwd = $cwd | .transcript_path = $tp | .state = "busy" | .last_activity = $t' ;;
@@ -194,7 +254,7 @@ EOF
       update_rec "$sid" --arg sid "$sid" --arg cwd "$cwd" --arg tp "$transcript" --argjson t "$t" \
         '.session_id = $sid | .cwd = $cwd | .transcript_path = $tp | .state = "idle" | .last_activity = $t' ;;
     SessionEnd)
-      rm -f "$f" ;;
+      rm -f "$f" "$HANDOFF_HOME/resume-$sid.command" ;;
   esac
   return 0
 }
@@ -344,10 +404,10 @@ handoff_one() {
   local f="$1" dry="$2" deadline="$3" sid cwd transcript branch default newb brief cloud_id url t0
   local orig prev_remote made_branch=0 made_commit=0 pushed=0
   t0="$(now)"
-  sid="$(field "$f" .session_id)"
+  sid="$(basename "$f" .json)"
   cwd="$(field "$f" .cwd)"
   transcript="$(field "$f" .transcript_path)"
-  cd "$cwd" 2>/dev/null || { fail_handoff "$sid" "working directory $cwd is gone"; return; }
+  { [ -n "$cwd" ] && cd "$cwd" 2>/dev/null; } || { fail_handoff "$sid" "working directory $cwd is gone"; return; }
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { log "skip $sid: $cwd is not a git checkout"; return; }
   git remote get-url origin >/dev/null 2>&1 || { log "skip $sid: $cwd has no origin remote"; return; }
   # The lid may have opened while the handoff was waiting (for example on a privacy prompt).
@@ -403,23 +463,24 @@ handoff_one() {
 }
 
 cmd_sleep() {
-  local dry=0 f pids="" deadline running p top prev_top="" cand
+  local dry=0 f pids="" deadline running p top prev_top="" cand cwd
   [ "${1:-}" = --dry-run ] && dry=1
   if [ "$TRIGGER" = lid ] && ! lid_closed; then log "sleep with the lid open; nothing handed off"; return 0; fi
   deadline=$(( $(now) + SLEEP_BUDGET ))
+  mkdir -p "$HANDOFF_HOME"
   cand="$HANDOFF_HOME/sleep-candidates.$$"
-  # shellcheck disable=SC2064 # expand now: the path is a local
-  trap "rm -f '$cand'" EXIT
-  # shellcheck disable=SC2064
-  trap "rm -f '$cand'; exit 1" TERM
+  cleanup_add "$cand"
   log "sleep: looking for busy sessions"
   # One cloud session per working tree: when several busy sessions share a tree, only
   # the most recently active one is handed off, so no two agents race on its commit.
   for f in "$SESSIONS"/*.json; do
     [ -f "$f" ] || continue
     eligible "$f" || continue
-    top="$(git -C "$(field "$f" .cwd)" rev-parse --show-toplevel 2>/dev/null)" || top="$(field "$f" .cwd)"
-    printf '%s\t%s\t%s\n' "$top" "$(field "$f" .last_activity)" "$f"
+    cwd="$(field "$f" .cwd)"
+    # git -C "" would use this process's own folder, so a missing cwd is skipped here.
+    [ -n "$cwd" ] && [ -d "$cwd" ] || { log "skip $(basename "$f" .json): working directory ${cwd:-(none)} is gone"; continue; }
+    top="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)" || top="$cwd"
+    printf '%s\t%s\t%s\n' "$top" "$(jq -r '.last_activity // 0' "$f" 2>/dev/null || echo 0)" "$f"
   done | sort -t "$(printf '\t')" -k1,1 -k2,2nr > "$cand"
   if [ -s "$cand" ] && [ -n "$HOTSPOT_SSID" ] && [ "$dry" != 1 ] && ! have_network 3; then
     join_hotspot "$(( deadline - 8 ))"
@@ -431,24 +492,29 @@ cmd_sleep() {
     fi
     prev_top="$top"
     ( handoff_one "$f" "$dry" "$deadline" ) &
-    pids="$pids $!"
+    pids="$pids $!:$(basename "$f" .json)"
+    # If the watcher stops this step (SIGTERM past its budget), the handoffs stop too.
+    CLEANUP_PIDS="$CLEANUP_PIDS $!"
   done < "$cand"
   [ -n "$pids" ] || { log "sleep: no busy sessions to hand off"; return 0; }
   # Handoffs run in parallel; anything still running at the deadline is stopped so the
-  # Mac can sleep, and is recorded as failed.
+  # Mac can sleep, and is recorded as failed so the wake step tells the user.
   while [ "$(now)" -lt "$deadline" ]; do
     running=0
-    for p in $pids; do kill -0 "$p" 2>/dev/null && running=1; done
+    for p in $pids; do kill -0 "${p%%:*}" 2>/dev/null && running=1; done
     [ "$running" = 0 ] && break
     sleep 0.2
   done
   for p in $pids; do
-    if kill -0 "$p" 2>/dev/null; then
-      pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null
+    if kill -0 "${p%%:*}" 2>/dev/null; then
+      stop_pid "${p%%:*}"
       log "a handoff ran past the ${SLEEP_BUDGET}s budget and was stopped"
+      [ "$dry" = 1 ] || [ "$(field "$(rec "${p#*:}")" .handoff.status)" = cloud ] \
+        || fail_handoff "${p#*:}" "the handoff ran past the ${SLEEP_BUDGET}s sleep budget; check the branch and the last commit in $(field "$(rec "${p#*:}")" .cwd)"
     fi
   done
   wait 2>/dev/null
+  CLEANUP_PIDS=""
   return 0
 }
 
@@ -559,13 +625,13 @@ cmd_wake() {
     [ -n "$(find "$lock" -maxdepth 0 -mmin +10 2>/dev/null)" ] || return 0
     rmdir "$lock" 2>/dev/null; mkdir "$lock" 2>/dev/null || return 0
   fi
-  # shellcheck disable=SC2064 # expand now: the path is a local
-  trap "rmdir '$lock' 2>/dev/null" EXIT
+  cleanup_add "$lock"
+  maybe_prune
   for f in "$SESSIONS"/*.json; do
     [ -f "$f" ] || continue
     if [ "$(field "$f" .handoff.status)" = failed ]; then
       notify "Cloud handoff failed" "$(field "$f" .handoff.error)"
-      update_rec "$(field "$f" .session_id)" 'del(.handoff)'
+      update_rec "$(basename "$f" .json)" 'del(.handoff)'
     fi
     [ "$(field "$f" .handoff.status)" = cloud ] && any=1
   done
@@ -574,7 +640,7 @@ cmd_wake() {
   for f in "$SESSIONS"/*.json; do
     [ -f "$f" ] || continue
     [ "$(field "$f" .handoff.status)" = cloud ] || continue
-    sid="$(field "$f" .session_id)"
+    sid="$(basename "$f" .json)"
     send_wrapup "$sid"
     if [ "$AUTO_RESUME" = 1 ]; then
       open_resume_terminal "$sid"
@@ -660,8 +726,79 @@ cmd_release() {
   [ "$(field "$f" .handoff.status)" = cloud ] && send_wrapup "$sid"
   cloud_id="$(field "$f" .handoff.cloud_id)"
   update_rec "$sid" 'del(.handoff)'
+  rm -f "$HANDOFF_HOME/resume-$sid.command"
   log "released $sid from cloud session ${cloud_id:-none}"
   echo "Session $sid is no longer paused. Pull the cloud branch first if you want its work."
+}
+
+# --- prune --------------------------------------------------------------------------
+# Forgets what is no longer needed: sessions teleported back more than RESUMED_KEEP_HOURS
+# ago, handoffs and sessions with no activity for PRUNE_DAYS, sessions whose transcript
+# is gone, resume .command files nobody ran, and files left by processes that died.
+# Runs at most hourly from SessionStart and wake, or any time with `sleepwalk prune`.
+prune_rec() { # prune_rec <session-id> <why>
+  rm -f "$(rec "$1")" "$HANDOFF_HOME/resume-$1.command"
+  rmdir "$(rec "$1").lock" 2>/dev/null
+  log "pruned $1: $2"
+  pruned=$((pruned + 1))
+}
+
+cmd_prune() {
+  local f sid status at last tp seen t c pruned=0
+  t="$(now)"
+  for f in "$SESSIONS"/*.json; do
+    [ -f "$f" ] || continue
+    sid="$(basename "$f" .json)"
+    IFS=$'\037' read -r status at last tp <<EOF
+$(jq -r '[.handoff.status // "", (.handoff.resumed_at // .handoff.at // 0), .last_activity // 0, .transcript_path // ""] | map(tostring) | join("\u001f")' "$f" 2>/dev/null)
+EOF
+    case "${last:-}" in ''|*[!0-9]*) last=0 ;; esac
+    case "${at:-}" in ''|*[!0-9]*) at=0 ;; esac
+    seen=""
+    if [ -n "${tp:-}" ]; then
+      seen="$(stat -f %m "$tp" 2>/dev/null)" && [ "$seen" -gt "$last" ] && last="$seen"
+    fi
+    case "${status:-}" in
+      resumed)
+        [ $((t - at)) -gt $((RESUMED_KEEP_HOURS * 3600)) ] && prune_rec "$sid" "teleported back over ${RESUMED_KEEP_HOURS}h ago" ;;
+      cloud|returning)
+        [ $((t - at)) -gt $((PRUNE_DAYS * 86400)) ] && prune_rec "$sid" "handed off over ${PRUNE_DAYS} days ago and never resumed" ;;
+      *)
+        if [ $((t - last)) -gt $((PRUNE_DAYS * 86400)) ]; then
+          prune_rec "$sid" "no activity for ${PRUNE_DAYS} days"
+        elif [ -n "${tp:-}" ] && [ -z "$seen" ] && [ $((t - last)) -gt 86400 ]; then
+          prune_rec "$sid" "transcript $tp is gone"
+        fi ;;
+    esac
+  done
+  # A resume .command is useful only while its session is still waiting in the cloud, and
+  # for a day at most; `sleepwalk resume` does the same job after that.
+  for c in "$HANDOFF_HOME"/resume-*.command; do
+    [ -f "$c" ] || continue
+    sid="$(basename "$c" .command)"; sid="${sid#resume-}"
+    status="$(field "$(rec "$sid")" .handoff.status)"
+    if [ "$status" != cloud ] && [ "$status" != returning ]; then
+      rm -f "$c"; log "removed $(basename "$c"): the session is no longer in the cloud"
+    elif [ -n "$(find "$c" -mmin +1440 2>/dev/null)" ]; then
+      rm -f "$c"; log "removed $(basename "$c"): unused for a day"
+    fi
+  done
+  # Temporary files and locks left behind by a process that was killed.
+  find "$SESSIONS" -maxdepth 1 -name '*.tmp' -mmin +10 -exec rm -f {} + 2>/dev/null
+  find "$SESSIONS" -maxdepth 1 -name '*.lock' -type d -mmin +10 -exec rmdir {} + 2>/dev/null
+  find "$HANDOFF_HOME" -maxdepth 1 \( -name 'sleep-candidates.*' -o -name 'cloud-create-*' \) -mmin +60 -exec rm -f {} + 2>/dev/null
+  rotate_log "$LOG"
+  rotate_log "$HANDOFF_HOME/sleepwatch.log"
+  [ "${1:-}" = --quiet ] || echo "Pruned $pruned session record(s)."
+  return 0
+}
+
+# Runs cmd_prune at most once an hour, quietly.
+maybe_prune() {
+  local stamp="$HANDOFF_HOME/last-prune"
+  [ -n "$(find "$stamp" -mmin -60 2>/dev/null)" ] && return 0
+  mkdir -p "$HANDOFF_HOME" && : > "$stamp"
+  cmd_prune --quiet >/dev/null 2>&1
 }
 
 cmd_status() {
@@ -705,7 +842,7 @@ write_settings() {
   cp "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak-sleepwalk"
   tmp="$CLAUDE_SETTINGS.$$.tmp"
   settings_with_hooks "$cmd" < "$CLAUDE_SETTINGS" > "$tmp" && mv "$tmp" "$CLAUDE_SETTINGS" \
-    || die "could not update $CLAUDE_SETTINGS (backup at $CLAUDE_SETTINGS.bak-sleepwalk)"
+    || { rm -f "$tmp"; die "could not update $CLAUDE_SETTINGS (backup at $CLAUDE_SETTINGS.bak-sleepwalk)"; }
 }
 
 cmd_install() {
@@ -783,6 +920,7 @@ sleepwalk: hand busy Claude Code sessions to the cloud when the Mac sleeps.
   status             list tracked sessions and their handoffs
   resume <session>   bring a handed-off session back here with claude --teleport
   release <session>  drop a handoff and unpause the local copy
+  prune              forget old session records and leftover files (also runs hourly)
   trust <folder>     record Claude Code trust for this exact folder (see README)
   hotspot [name]     list saved iPhone hotspots, or choose the one to join when offline
   sleep [--dry-run]  what the watcher runs before sleep (dry run writes the brief only)
@@ -804,6 +942,7 @@ case "$cmd" in
   resume) cmd_resume "$@" ;;
   release) cmd_release "$@" ;;
   status) cmd_status "$@" ;;
+  prune) cmd_prune "$@" ;;
   install) cmd_install "$@" ;;
   uninstall) cmd_uninstall "$@" ;;
   help|-h|--help) cmd_help ;;

@@ -131,6 +131,7 @@ terminal, `~/.claude/sleepwalk/bin/sleepwalk`:
 | `status` | Tracked sessions, their state and handoffs, and whether the watcher runs |
 | `resume <session>` | Brings a handed-off session back by hand |
 | `release <session>` | Drops a handoff and unpauses the local copy |
+| `prune` | Forgets old session records and leftover files now (it also runs hourly) |
 | `trust <folder>` | Records Claude Code trust for exactly this folder |
 | `hotspot [name]` | Lists saved iPhone hotspots, or picks one to join when offline |
 | `sleep --dry-run` | Shows what a sleep would do, and writes the brief, without doing it |
@@ -150,6 +151,9 @@ terminal, `~/.claude/sleepwalk/bin/sleepwalk`:
 | `TERMINAL_APP` | `Terminal` | For example `iTerm` |
 | `HOTSPOT_SSID` | (none) | Network to join when offline; set it with `sleepwalk hotspot` |
 | `SLEEP_BUDGET` | `22` | Seconds the lid-close step may take (macOS forces sleep at about 30) |
+| `RESUMED_KEEP_HOURS` | `24` | How long to keep a session's record after it was teleported back |
+| `PRUNE_DAYS` | `7` | Forget sessions, and handoffs never resumed, after this many days without activity |
+| `LOG_MAX_KB` | `1024` | Past this size `handoff.log` and `sleepwatch.log` move to `<log>.1` and start afresh |
 
 ## Things to know
 
@@ -163,6 +167,10 @@ terminal, `~/.claude/sleepwalk/bin/sleepwalk`:
 - **Processes the session started keep running.** Sleepwalk pauses the session's tool
   calls, but a build or script it had already started carries on when the Mac wakes. If
   it changes files, `--teleport` offers to stash them.
+- **Old records clean themselves up.** At most once an hour, at session start and on wake,
+  Sleepwalk forgets sessions teleported back over a day ago, sessions and handoffs idle for
+  a week, resume `.command` files nobody ran, and leftovers from killed processes. The
+  old copy of a session teleported back is unpaused when its record goes.
 - **A closed lid with an external display** does not sleep, so nothing is handed off.
 - **Not an Anthropic product.** Sleepwalk is an independent open-source plugin that uses
   Claude Code's public CLI.
