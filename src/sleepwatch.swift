@@ -86,6 +86,24 @@ NSWorkspace.shared.notificationCenter.addObserver(
     runTool("wake", wait: nil)
 }
 
+// `sleepwalk simulate` sends SIGUSR1 and SIGUSR2 to rehearse a sleep and a wake, so the
+// steps run exactly as they would from here, without closing the lid.
+signal(SIGUSR1, SIG_IGN)
+signal(SIGUSR2, SIG_IGN)
+let simulatedSleep = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+simulatedSleep.setEventHandler {
+    log("simulated sleep")
+    runTool("sleep", wait: sleepBudget)
+    log("simulated sleep finished")
+}
+simulatedSleep.resume()
+let simulatedWake = DispatchSource.makeSignalSource(signal: SIGUSR2, queue: .main)
+simulatedWake.setEventHandler {
+    log("simulated wake")
+    runTool("wake", wait: nil)
+}
+simulatedWake.resume()
+
 log("watching for sleep and wake; handoff tool \(tool), budget \(Int(sleepBudget))s")
 // Raise any macOS privacy prompts now, while the user is at the Mac, not at lid close.
 runTool("preflight", wait: nil)

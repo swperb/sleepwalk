@@ -293,6 +293,59 @@ check "hotspot stores the saved spelling" sh -c ". '$SLEEPWALK_HOME/config'; [ \
 check "hotspot refuses a name that is not saved" sh -c "! NETWORKSETUP='$T/fake-networksetup' '$TOOL' hotspot 'Nobody' 2>/dev/null"
 check "hotspot lists the saved iPhones" sh -c "NETWORKSETUP='$T/fake-networksetup' '$TOOL' hotspot | grep -q 'Sam'"
 
+# --- simulate: a rehearsed lid close, nap and lid open, run here (no launchd in tests).
+# `open` and `osascript` are faked so no Terminal window or notification appears.
+mkdir -p "$T/fakebin"
+printf '#!/bin/bash\necho "$@" >> "$SLEEPWALK_HOME/opened"\n' > "$T/fakebin/open"
+printf '#!/bin/bash\nexit 0\n' > "$T/fakebin/osascript"
+chmod +x "$T/fakebin/open" "$T/fakebin/osascript"
+mkrepo sim
+jq --arg d "$T/sim" '.projects[$d] = {hasTrustDialogAccepted: true}' "$CLAUDE_CONFIG_FILE" > "$T/c.tmp" && mv "$T/c.tmp" "$CLAUDE_CONFIG_FILE"
+for f in "$SLEEPWALK_HOME"/sessions/*.json; do hook Stop "$(basename "$f" .json)" >/dev/null; done
+sim() { PATH="$T/fakebin:$PATH" SLEEPWALK_NETWORK=fake SLEEPWALK_LID= "$TOOL" simulate "$@" < /dev/null; }
+touch "$SLEEPWALK_HOME/net-up"
+
+out="$(sim --nap 0)"
+check "simulate with nothing busy says so" sh -c "printf '%s' \"\$1\" | grep -q 'No busy session'" _ "$out"
+hook PreToolUse sess-sim1 "$T/sim"
+hook PreToolUse sess-self "$T/hotspot"
+sim --nap 0 >/dev/null 2>&1
+check "simulate asks before a real handoff" [ "$(rec sess-sim1 | jq -r '.handoff.status // "none"')" = none ]
+out="$(CLAUDE_CODE_SESSION_ID=sess-self sim --nap 1 --yes 2>&1)"
+check "simulate hands the busy session off" [ "$(rec sess-sim1 | jq -r .handoff.status)" = returning ]
+check "simulate reports the cloud link" sh -c "printf '%s' \"\$1\" | grep -q 'sess-sim  handed off after [0-9]*s: https://claude.ai/code/session_01TEST'" _ "$out"
+check "the session running the rehearsal sits it out" [ "$(rec sess-self | jq -r '.handoff.status // "none"')" = none ]
+check "the wake step opens the resume terminal" grep -q "resume-sess-sim1.command" "$SLEEPWALK_HOME/opened"
+check "simulate leaves no override behind" [ ! -f "$SLEEPWALK_HOME/simulate" ]
+SLEEPWALK_LID= "$TOOL" sleep
+check "and the real lid is read again" sh -c "tail -1 '$SLEEPWALK_HOME/handoff.log' | grep -q 'sleep with the lid open'"
+hook SessionEnd sess-self
+
+# --offline keeps the network down after the wake, without joining the real hotspot (the
+# wake step reaches for it after 8 seconds).
+"$TOOL" release sess-sim1 >/dev/null
+rm -f "$SLEEPWALK_HOME/opened" "$SLEEPWALK_HOME/joined"
+hook PreToolUse sess-sim1 "$T/sim"
+echo more > "$T/sim/m.txt"
+t0="$(date +%s)"
+NETWORKSETUP="$T/fake-networksetup" HOTSPOT_SSID="Robin's iPhone" sim --nap 0 --offline 10 --yes >/dev/null 2>&1
+check "an offline wake waits for the network" [ $(( $(date +%s) - t0 )) -ge 10 ]
+check "then resumes" grep -q "resume-sess-sim1.command" "$SLEEPWALK_HOME/opened"
+check "a simulated outage never joins the real hotspot" [ ! -f "$SLEEPWALK_HOME/joined" ]
+check "the log notes the hotspot it would join" grep -q "simulated: no network; would join " "$SLEEPWALK_HOME/handoff.log"
+"$TOOL" release sess-sim1 >/dev/null
+hook SessionEnd sess-sim1
+
+# An override left by a rehearsal that died is ignored after half an hour.
+printf 'SIM_LID=closed\n' > "$SLEEPWALK_HOME/simulate"
+touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$SLEEPWALK_HOME/simulate"
+hook PreToolUse sess-sim2 "$T/sim"
+SLEEPWALK_LID=open "$TOOL" sleep
+SLEEPWALK_LID= "$TOOL" sleep
+check "a stale override does not close the lid" [ "$(rec sess-sim2 | jq -r '.handoff.status // "none"')" = none ]
+rm -f "$SLEEPWALK_HOME/simulate"
+hook SessionEnd sess-sim2
+
 "$TOOL" uninstall >/dev/null
 check "uninstall removes only its hooks" [ "$(jq -c .hooks "$SLEEPWALK_SETTINGS")" = '{"Stop":[{"hooks":[{"type":"command","command":"say done"}]}]}' ]
 
