@@ -80,9 +80,10 @@ notice and holds sleep off for a few seconds. For each busy session, one per wor
    clones inside the checkout) and files over `MAX_FILE_MB`. The commit message, the log
    and the cloud session's brief list what was left out. Real submodules are committed
    as usual.
-3. A cloud session starts and receives a brief: your original request and the latest
-   part of the conversation, with instructions to carry on, push small steps, and stop
-   when you are back.
+3. A cloud session starts and receives a brief: your original request, the latest part
+   of the conversation, the session's task list, and its last tool calls with whether
+   each one finished or was still running. It is told to carry on, push small steps, and
+   end with a summary for you when you are back.
 4. The local session is paused. Its tool calls and prompts are refused with a note saying
    where the work went, so two agents never edit the same tree.
 
@@ -178,8 +179,8 @@ terminal, `~/.claude/sleepwalk/bin/sleepwalk`:
 - **Untracked files are pushed.** Anything not in `.gitignore` goes into the WIP commit
   and to GitHub. Keep secrets ignored.
 - **The cloud agent gets a brief, not your conversation.** There is no way to move a local
-  transcript into a cloud session, so it sees your original request, the recent messages
-  and the repository. Coming back is complete: `--teleport` loads the whole cloud
+  transcript into a cloud session, so it sees your original request, the recent messages,
+  the task list, the last few tool calls and the repository. Coming back is complete: `--teleport` loads the whole cloud
   conversation.
 - **Processes the session started keep running.** Sleepwalk pauses the session's tool
   calls, but a build or script it had already started carries on when the Mac wakes. If
