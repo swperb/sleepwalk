@@ -42,6 +42,14 @@ NETWORKSETUP="${NETWORKSETUP:-/usr/sbin/networksetup}"  # where Claude Code keep
 # shellcheck source=/dev/null
 [ -f "$CONFIG" ] && . "$CONFIG"
 
+# sleepwalk simulate writes this file for the length of a rehearsal. It makes the lid read
+# as closed, the network as down, or narrows which sessions are handed off. It is ignored
+# once it is half an hour old, so a rehearsal that dies cannot leave it in force.
+SIMULATE="$HANDOFF_HOME/simulate"
+SIM_LID="" SIM_OFFLINE_UNTIL=0 SIM_ONLY="" SIM_SKIP=""
+# shellcheck source=/dev/null
+if [ -f "$SIMULATE" ] && [ -z "$(find "$SIMULATE" -mmin +30 2>/dev/null)" ]; then . "$SIMULATE"; fi
+
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
 WRAPUP_MSG='The user has opened their laptop again and will continue this session there. Stop starting new work. Commit everything (if tests fail, say so in the commit message) and push the branch. Then end with a short summary for the user: what you did, what is left, and any decisions you made for them.'
@@ -137,6 +145,7 @@ field() { jq -r "$2 // empty" "$1" 2>/dev/null; }
 
 lid_closed() {
   [ -n "${SLEEPWALK_LID:-}" ] && { [ "$SLEEPWALK_LID" = closed ]; return; }
+  [ -n "$SIM_LID" ] && { [ "$SIM_LID" = closed ]; return; }
   ioreg -r -k AppleClamshellState -d 4 2>/dev/null | grep -q '"AppleClamshellState" = Yes'
 }
 
@@ -434,6 +443,14 @@ eligible() {
   return 1
 }
 
+# During a rehearsal, true for a session that sits it out: the one running the rehearsal,
+# or any other than the one it was limited to.
+simulated_out() {
+  [ -n "$SIM_SKIP" ] && [ "$1" = "$SIM_SKIP" ] && return 0
+  [ -n "$SIM_ONLY" ] && [ "$1" != "$SIM_ONLY" ] && return 0
+  return 1
+}
+
 fail_handoff() {
   local sid="$1"; shift
   log "handoff $sid failed: $*"
@@ -680,6 +697,7 @@ cmd_sleep() {
   for f in "$SESSIONS"/*.json; do
     [ -f "$f" ] || continue
     eligible "$f" || continue
+    simulated_out "$(field "$f" .session_id)" && continue
     cwd="$(field "$f" .cwd)"
     # git -C "" would use this process's own folder, so a missing cwd is skipped here.
     [ -n "$cwd" ] && [ -d "$cwd" ] || { log "skip $(basename "$f" .json): working directory ${cwd:-(none)} is gone"; continue; }
@@ -724,6 +742,7 @@ cmd_sleep() {
 
 # --- network ------------------------------------------------------------------------
 have_network() {
+  [ "$SIM_OFFLINE_UNTIL" -gt "$(now)" ] && return 1
   # SLEEPWALK_NETWORK=fake lets the tests decide: up once $HANDOFF_HOME/net-up exists.
   if [ "${SLEEPWALK_NETWORK:-}" = fake ]; then [ -f "$HANDOFF_HOME/net-up" ]; return; fi
   curl -s -o /dev/null -m "${1:-5}" https://claude.ai
@@ -736,6 +755,9 @@ have_network() {
 join_hotspot() {
   local dev until
   [ -n "$HOTSPOT_SSID" ] || return 1
+  if [ "$SIM_OFFLINE_UNTIL" -gt "$(now)" ]; then
+    log "simulated: no network; would join $HOTSPOT_SSID now"; return 1
+  fi
   dev="$(wifi_device)"
   [ -n "$dev" ] || { log "no Wi-Fi device found to join $HOTSPOT_SSID"; return 1; }
   log "no network; joining $HOTSPOT_SSID on $dev"
@@ -1346,6 +1368,133 @@ EOF
   return 0
 }
 
+# --- simulate -----------------------------------------------------------------------
+# sleepwalk simulate rehearses a lid close and a lid open without doing either. The lid
+# reads as closed for the sleep step, the Mac stays awake through the nap, and then the
+# wake step runs as it does when the lid opens. It goes through the running watcher, so
+# launchd's PATH and the watcher's privacy grants are part of the rehearsal; --direct runs
+# the steps here instead. The handoff is real: the work is pushed and a cloud session
+# starts. The Claude Code session that runs the rehearsal is left alone.
+SIMULATE_USAGE="usage: sleepwalk simulate [--nap <seconds>] [--offline <seconds>] [--only <session>] [--direct] [--yes]"
+
+# Prints the sessions a sleep would hand off right now, one "<id>\t<folder>" per line.
+sleep_candidates() {
+  local f
+  for f in "$SESSIONS"/*.json; do
+    [ -f "$f" ] || continue
+    eligible "$f" || continue
+    simulated_out "$(field "$f" .session_id)" && continue
+    printf '%s\t%s\n' "$(field "$f" .session_id)" "$(field "$f" .cwd)"
+  done
+}
+
+watcher_rehearses() {
+  [ -z "${SLEEPWALK_NO_LAUNCHD:-}" ] && launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 \
+    && grep -q 'simulated sleep finished' "$HANDOFF_HOME/bin/sleepwatch" 2>/dev/null
+}
+
+# sim_step <sleep|wake> <watcher:0|1>: runs one step, through the watcher or here, and
+# returns once it is done.
+sim_step() {
+  local step="$1" sig=SIGUSR1 wlog="$HANDOFF_HOME/sleepwatch.log" lines end
+  if [ "$2" != 1 ]; then "$SELF" "$step"; return; fi
+  [ "$step" = wake ] && sig=SIGUSR2
+  lines="$(wc -l < "$wlog" 2>/dev/null | tr -d ' ')"
+  launchctl kill "$sig" "gui/$(id -u)/$LABEL" || { echo "could not signal the watcher; running $step here"; "$SELF" "$step"; return; }
+  if [ "$step" = sleep ]; then
+    end=$(( $(now) + SLEEP_BUDGET + 15 ))
+    until tail -n +"$(( ${lines:-0} + 1 ))" "$wlog" 2>/dev/null | grep -q 'simulated sleep finished'; do
+      [ "$(now)" -lt "$end" ] || { echo "the watcher did not finish the sleep step"; return 1; }
+      sleep 0.3
+    done
+  else
+    # The wake step holds wake.lock while it runs.
+    end=$(( $(now) + 5 ))
+    until [ -d "$HANDOFF_HOME/wake.lock" ] || [ "$(now)" -ge "$end" ]; do sleep 0.2; done
+    end=$(( $(now) + NETWORK_WAIT + 60 ))
+    while [ -d "$HANDOFF_HOME/wake.lock" ] && [ "$(now)" -lt "$end" ]; do sleep 0.5; done
+  fi
+}
+
+# countdown <seconds> <label>: waits, on one updating line when on a terminal; Enter ends it.
+countdown() {
+  local end=$(( $(now) + $1 )) left
+  while [ "$(now)" -lt "$end" ]; do
+    left=$(( end - $(now) ))
+    if [ -t 1 ]; then printf '\r  %s %ss  (Enter to skip) \033[K' "$2" "$left"; fi
+    if [ -t 0 ]; then read -r -t 1 _ && break; else sleep 1; fi
+  done
+  if [ -t 1 ]; then printf '\r\033[K'; fi
+}
+
+cmd_simulate() {
+  local nap=60 offline=0 only="" direct=0 yes=0 watcher=0 t0 cands f sid st
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --nap) nap="${2:-}"; shift ;;
+      --offline) offline="${2:-}"; shift ;;
+      --only) only="$(resolve_sid "${2:-}")" || exit 1; shift ;;
+      --direct) direct=1 ;;
+      --yes|-y) yes=1 ;;
+      *) die "$SIMULATE_USAGE" ;;
+    esac
+    shift
+  done
+  case "$nap$offline" in ''|*[!0-9]*) die "$SIMULATE_USAGE" ;; esac
+  [ "$offline" -le 600 ] || die "--offline is at most 600 seconds"
+  mkdir -p "$HANDOFF_HOME"
+  [ "$direct" = 0 ] && watcher_rehearses && watcher=1
+
+  SIM_ONLY="$only"; SIM_SKIP="${CLAUDE_CODE_SESSION_ID:-}"
+  cands="$(sleep_candidates)"
+  if [ -z "$cands" ]; then
+    echo "No busy session to hand off, so a lid close now would do nothing."
+    echo "Start a turn in a Claude Code session in a git repository, then run this again."
+    [ -n "$SIM_SKIP" ] && echo "(The session running this rehearsal always sits it out.)"
+    return 0
+  fi
+  echo "Rehearsing a lid close. These sessions will really be pushed and handed to the cloud:"
+  printf '%s\n' "$cands" | while IFS="$(printf '\t')" read -r sid f; do
+    printf '  %s  %s\n' "$(printf '%s' "$sid" | cut -c1-8)" "$f"
+  done
+  echo "Then a ${nap}s nap$([ "$offline" -gt 0 ] && echo ", no network for ${offline}s after waking"), and a lid open, $([ "$watcher" = 1 ] && echo "through the running watcher" || echo "run here (--direct)")."
+  if [ "$yes" != 1 ]; then
+    [ -t 0 ] || die "add --yes to run without asking"
+    printf 'Go ahead? [y/N] '
+    read -r st
+    case "$st" in y|Y|yes) ;; *) echo "Nothing done."; return 0 ;; esac
+  fi
+
+  cleanup_add "$SIMULATE"
+  { printf 'SIM_LID=closed\n'; printf 'SIM_ONLY=%q\nSIM_SKIP=%q\n' "$SIM_ONLY" "$SIM_SKIP"; } > "$SIMULATE"
+  t0="$(now)"
+  log "simulate: lid close (nap ${nap}s, offline ${offline}s)"
+  echo
+  echo "Lid closed."
+  sim_step sleep "$watcher"
+  rm -f "$SIMULATE"
+  for f in "$SESSIONS"/*.json; do
+    [ -f "$f" ] || continue
+    [ "$(field "$f" .handoff.at)" -ge "$t0" ] 2>/dev/null || continue
+    sid="$(field "$f" .session_id | cut -c1-8)"
+    case "$(field "$f" .handoff.status)" in
+      cloud) printf '  %s  handed off after %ss: %s (branch %s)\n' "$sid" \
+               "$(( $(field "$f" .handoff.at) - t0 ))" "$(field "$f" .handoff.url)" "$(field "$f" .handoff.branch)" ;;
+      failed) printf '  %s  not handed off: %s\n' "$sid" "$(field "$f" .handoff.error)" ;;
+    esac
+  done
+
+  echo
+  countdown "$nap" "Asleep."
+  if [ "$offline" -gt 0 ]; then
+    printf 'SIM_OFFLINE_UNTIL=%s\n' "$(( $(now) + offline ))" > "$SIMULATE"
+  fi
+  log "simulate: lid open after $(( $(now) - t0 ))s"
+  echo "Lid open."
+  sim_step wake "$watcher"
+  echo "Done in $(( $(now) - t0 ))s. The log is $LOG"
+}
+
 # --- install ------------------------------------------------------------------------
 HOOK_EVENTS='["SessionStart","UserPromptSubmit","PreToolUse","Stop","SessionEnd"]'
 
@@ -1455,6 +1604,8 @@ sleepwalk: hand busy Claude Code sessions to the cloud when the Mac sleeps.
   prune              forget old session records and leftover files (also runs hourly)
   trust <folder>     record Claude Code trust for this exact folder (see README)
   hotspot [name]     list saved iPhone hotspots, or choose the one to join when offline
+  simulate [--nap <s>] [--offline <s>] [--only <session>] [--direct] [--yes]
+                     rehearse a lid close, a nap and a lid open, for real but awake
   sleep [--dry-run]  what the watcher runs before sleep (dry run writes the brief only)
   wake               what the watcher runs after wake
   hook               what Claude Code runs for each hook event (reads JSON on stdin)
@@ -1471,6 +1622,7 @@ case "$cmd" in
   trust) cmd_trust "$@" ;;
   hotspot) cmd_hotspot "$@" ;;
   wake) cmd_wake "$@" ;;
+  simulate) cmd_simulate "$@" ;;
   resume) cmd_resume "$@" ;;
   release) cmd_release "$@" ;;
   status) cmd_status "$@" ;;
