@@ -41,6 +41,13 @@ case " $* " in
       IFS= read -rsn1 _ && echo answered >> "$SLEEPWALK_HOME/trust-answered"
       exit 1
     fi
+    # Claude Code's debug log says whether it cloned from GitHub or uploaded the checkout.
+    dbg=""; prev=""; for a in "$@"; do [ "$prev" = --debug-file ] && dbg="$a"; prev="$a"; done
+    case "${FAKE_SOURCE:-github}" in
+      github) echo "2026-10-19T12:00:00Z [DEBUG] GitHub app is installed on acme/widgets" >> "$dbg" ;;
+      upload) printf '%s\n' "[DEBUG] GitHub app is not installed on acme/widgets" \
+        "[DEBUG] [teleportToRemote] Bundling (reason: github_preflight_failed)" >> "$dbg" ;;
+    esac
     printf '\033[?25lCreated cloud session: test\r\nView: https://claude.ai/code/session_01TEST?from=cli&m=0\r\nResume with: claude --teleport session_01TEST\r\n'
     sleep 60 ;;
 esac
@@ -124,8 +131,10 @@ args="$(cat "$SLEEPWALK_HOME"/claude-args-* | tr '\0' '\n')"
 check "the session is created with the holding prompt" sh -c "printf '%s' \"\$1\" | grep -q 'Your instructions arrive in the next message'" _ "$args"
 check "the brief is sent to the new session" sh -c "printf '%s' \"\$1\" | grep -q '^session_01TEST\$' && printf '%s' \"\$1\" | grep -q 'Add a fillet tool'" _ "$args"
 check "the create call does not use -p" sh -c "! tr '\\0' '\\n' < '$SLEEPWALK_HOME/claude-args-000' | grep -q '^-p\$'"
-check "the attached client is stopped" sh -c "! pgrep -f 'fake-claude --cloud' >/dev/null"
+check "the attached client is stopped" sh -c "! pgrep -f 'fake-claude --debug-file' >/dev/null"
 check "the cloud url is recorded" [ "$(rec | jq -r .handoff.url)" = https://claude.ai/code/session_01TEST ]
+check "a cloud copy cloned from GitHub is recorded" [ "$(rec | jq -r .handoff.source)" = github ]
+check "the create's debug log is cleaned up" sh -c "! ls '$SLEEPWALK_HOME' | grep -q '^cloud-create-'"
 
 check "the sleep step leaves no temporary files" sh -c "! ls '$SLEEPWALK_HOME' | grep -q 'sleep-candidates'"
 check "the log says how long the handoff took" grep -qE 'to cloud session session_01TEST https://claude.ai/code/session_01TEST after [0-9]+s' "$SLEEPWALK_HOME/handoff.log"
@@ -292,6 +301,38 @@ NETWORKSETUP="$T/fake-networksetup" "$TOOL" hotspot "alex's iphone (2)" >/dev/nu
 check "hotspot stores the saved spelling" sh -c ". '$SLEEPWALK_HOME/config'; [ \"\$HOTSPOT_SSID\" = \"\$(printf 'Alex\\342\\200\\231s iPhone (2)')\" ]"
 check "hotspot refuses a name that is not saved" sh -c "! NETWORKSETUP='$T/fake-networksetup' '$TOOL' hotspot 'Nobody' 2>/dev/null"
 check "hotspot lists the saved iPhones" sh -c "NETWORKSETUP='$T/fake-networksetup' '$TOOL' hotspot | grep -q 'Sam'"
+
+# --- cloud push access: a cloud copy uploaded instead of cloned cannot push, so say so.
+mkrepo gh
+( cd "$T/gh" && git remote set-url origin https://github.com/acme/widgets.git \
+  && git config url."$T/gh.git".pushInsteadOf https://github.com/acme/widgets.git )
+jq --arg d "$T/gh" '.projects[$d] = {hasTrustDialogAccepted: true}' "$CLAUDE_CONFIG_FILE" > "$T/c.tmp" && mv "$T/c.tmp" "$CLAUDE_CONFIG_FILE"
+out="$(hook SessionStart sess-gh01 "$T/gh")"
+check "a GitHub repository with no handoff yet gets no push hint" sh -c "! printf '%s' \"\$1\" | grep -q 'cannot push'" _ "$out"
+hook PreToolUse sess-gh01 "$T/gh"
+FAKE_SOURCE=upload SLEEPWALK_LID=closed "$TOOL" sleep
+check "an uploaded cloud copy still hands off" [ "$(rec sess-gh01 | jq -r .handoff.status)" = cloud ]
+check "the upload is recorded on the session" [ "$(rec sess-gh01 | jq -r .handoff.source)" = upload:app_not_installed ]
+check "the log says the cloud session cannot push, and why" \
+  grep -q 'sess-gh01: cannot push from the cloud.*Claude GitHub App is not installed on acme/widgets' "$SLEEPWALK_HOME/handoff.log"
+check "status names the repository that cannot push" sh -c "'$TOOL' status | grep '^cloud push: acme/widgets: .*github.com/apps/claude' >/dev/null"
+out="$(hook SessionStart sess-gh02 "$T/gh")"
+check "SessionStart tells Claude the cloud copy cannot push" sh -c "printf '%s' \"\$1\" | grep -q 'not installed on acme/widgets' && printf '%s' \"\$1\" | grep -q 'Handoffs still happen'" _ "$out"
+check "it says so only once per repository" [ -z "$(hook SessionStart sess-gh03 "$T/gh")" ]
+hook SessionEnd sess-gh03
+"$TOOL" release sess-gh01 >/dev/null
+hook PreToolUse sess-gh02 "$T/gh"
+echo more > "$T/gh/w2.txt"
+SLEEPWALK_LID=closed "$TOOL" sleep
+check "a later clone from GitHub replaces the record" [ "$(rec sess-gh02 | jq -r .handoff.source)" = github ]
+check "and status no longer warns" sh -c "! '$TOOL' status | grep '^cloud push:' >/dev/null"
+mkrepo plain
+out="$(hook SessionStart sess-pl01 "$T/plain")"
+check "SessionStart warns once about an origin that is not on GitHub" sh -c "printf '%s' \"\$1\" | grep -q 'is not on GitHub'" _ "$out"
+hook PreToolUse sess-pl01 "$T/plain"
+jq --arg d "$T/plain" '.projects[$d] = {hasTrustDialogAccepted: true}' "$CLAUDE_CONFIG_FILE" > "$T/c.tmp" && mv "$T/c.tmp" "$CLAUDE_CONFIG_FILE"
+FAKE_SOURCE=none SLEEPWALK_LID=closed "$TOOL" sleep
+check "a create whose debug log says nothing records no source" [ "$(rec sess-pl01 | jq -r '.handoff.status + " " + (.handoff.source // "none")')" = "cloud none" ]
 
 "$TOOL" uninstall >/dev/null
 check "uninstall removes only its hooks" [ "$(jq -c .hooks "$SLEEPWALK_SETTINGS")" = '{"Stop":[{"hooks":[{"type":"command","command":"say done"}]}]}' ]

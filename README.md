@@ -49,7 +49,9 @@ at the one moment you actually decide to stop: when the lid closes.
 You need macOS with the Xcode command line tools (`xcode-select --install`), `jq`, and
 Claude Code signed in with a claude.ai account that can use
 [Claude Code on the web](https://code.claude.com/docs/en/claude-code-on-the-web). Your
-repositories need a GitHub `origin` that the Claude GitHub app can read.
+repositories need a GitHub `origin` with the Claude GitHub App installed, or cloud
+sessions cannot push their work back (see
+[Cloud sessions that cannot push](#cloud-sessions-that-cannot-push)).
 
 In Claude Code:
 
@@ -101,6 +103,22 @@ Sleepwalk never answers that question for you. At the start of a session in such
 project, it asks Claude to check with you, once per project, and records trust with
 `sleepwalk trust <folder>` only if you agree. If you decline, a handoff from that project
 fails at once, is rolled back, and the log tells you what to run.
+
+## Cloud sessions that cannot push
+
+`claude --cloud` clones your repository from GitHub only when the
+[Claude GitHub App](https://github.com/apps/claude) is installed on it. Otherwise, and
+for an `origin` that is not on GitHub, Claude Code uploads your local checkout instead.
+That cloud copy has no git remote, so the cloud agent cannot push: its commits stay in the
+cloud, and only its conversation comes back with `sleepwalk resume`.
+
+Only the app itself can ask GitHub whether it is installed, so Sleepwalk learns Claude
+Code's answer when it creates the cloud session (from `claude --debug-file`). It never
+stops a handoff over it. When a cloud copy was uploaded, the handoff log and
+`sleepwalk status` say so, and the next session in that repository asks Claude to tell you
+once. An `origin` that is not on GitHub is flagged at session start, before any handoff.
+Install the app on the repository to fix it; the next handoff that clones clears the
+warning.
 
 ## Driving with your laptop in the bag
 
@@ -197,7 +215,7 @@ gives those.
 tests/test.sh
 ```
 
-The tests drive install, the hooks, sleep, rollback, folder trust, the hotspot, release,
+The tests drive install, the hooks, sleep, rollback, folder trust, cloud push access, the hotspot, release,
 resume and uninstall against a temporary home, local bare remotes and fake `claude` and
 `networksetup` commands. Real lid-close round trips were checked by hand.
 

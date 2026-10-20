@@ -204,6 +204,77 @@ cmd_trust() {
   echo "Claude Code now trusts $d (recorded in $CLAUDE_CONFIG_FILE; backup alongside it)."
 }
 
+# --- cloud push access --------------------------------------------------------------
+# `claude --cloud` clones the repository from GitHub only when the Claude GitHub App is
+# installed on it. Otherwise (or when origin is not on GitHub) it uploads the local
+# checkout instead, and that cloud copy has no remote: the cloud agent cannot push, and its
+# work comes back only in the conversation that `sleepwalk resume` teleports. Only the app
+# itself can ask GitHub whether it is installed, so Sleepwalk learns Claude Code's answer
+# from the create's debug log, keeps it per origin in $HANDOFF_HOME/repos, and shows it in
+# the log, in `sleepwalk status`, and once per repository at session start. It never stops
+# a handoff.
+
+repo_key() { printf '%s' "$1" | shasum | cut -c1-16; }
+
+# cloud_source_of <debug-log>: prints "github" when the create cloned from GitHub,
+# "upload:<reason>" when it uploaded the local checkout, and nothing when the log does not
+# say (for example a Claude Code version that logs differently).
+cloud_source_of() {
+  local why
+  why="$(sed -n 's/.*Bundling (reason: \([A-Za-z0-9_]*\)).*/\1/p' "$1" 2>/dev/null | head -1)"
+  grep -q 'GitHub app is not installed on' "$1" 2>/dev/null && why="app_not_installed"
+  if [ -n "$why" ]; then echo "upload:$why"
+  elif grep -q 'GitHub app is installed on' "$1" 2>/dev/null; then echo github; fi
+}
+
+# The GitHub owner/name in an origin URL, or the URL itself when it is not on GitHub.
+repo_name() {
+  case "$1" in
+    *github.com[:/]*) printf '%s\n' "$1" | sed -e 's#.*github\.com[:/]##' -e 's#\.git$##' -e 's#/$##' ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+# What a cloud copy of this origin cannot do, in a sentence, for the log and status.
+upload_note() {
+  local origin="$1" why="$2"
+  case "$why" in
+    app_not_installed)
+      printf 'Claude Code uploads this checkout to the cloud instead of cloning it, because the Claude GitHub App is not installed on %s, so cloud sessions cannot push their work; it comes back only with sleepwalk resume. Install the app at https://github.com/apps/claude to fix this.' "$(repo_name "$origin")" ;;
+    not_github|no_github_remote)
+      printf 'origin (%s) is not on GitHub, so Claude Code uploads this checkout to the cloud and cloud sessions cannot push their work; it comes back only with sleepwalk resume.' "$origin" ;;
+    *)
+      printf 'Claude Code uploaded this checkout to the cloud instead of cloning it from GitHub (%s), so the cloud session may not be able to push its work; it comes back with sleepwalk resume. If the Claude GitHub App is not installed on %s, install it at https://github.com/apps/claude.' "$why" "$(repo_name "$origin")" ;;
+  esac
+}
+
+# cloud_source <origin>: what the last handoff from this origin learned, if anything.
+cloud_source() { cut -f1 "$HANDOFF_HOME/repos/$(repo_key "$1")" 2>/dev/null; }
+
+record_cloud_source() {
+  [ -n "$2" ] || return 0
+  mkdir -p "$HANDOFF_HOME/repos" && printf '%s\t%s\n' "$2" "$1" > "$HANDOFF_HOME/repos/$(repo_key "$1")"
+}
+
+# At session start, in a repository whose cloud copies cannot push (known from an earlier
+# handoff, or because origin is not on GitHub), asks Claude to tell the user, once per
+# repository.
+cloud_hint() {
+  local d="$1" origin src marker
+  [ -n "$d" ] || return 0
+  origin="$(git -C "$d" remote get-url origin 2>/dev/null)" || return 0
+  src="$(cloud_source "$origin")"
+  case "$src" in
+    upload:*) ;;
+    github) return 0 ;;
+    *) case "$origin" in *github*) return 0 ;; esac; src="upload:not_github" ;;
+  esac
+  marker="$HANDOFF_HOME/cloud-told/$(repo_key "$origin")"
+  [ -f "$marker" ] && return 0
+  mkdir -p "$HANDOFF_HOME/cloud-told" && : > "$marker"
+  printf 'Sleepwalk: about handing this repository to the cloud when the lid closes: %s Tell the user this once, briefly. Handoffs still happen either way.\n' "$(upload_note "$origin" "${src#upload:}")"
+}
+
 # --- hook ---------------------------------------------------------------------------
 # Claude Code runs this for SessionStart, UserPromptSubmit, PreToolUse, Stop and
 # SessionEnd. It keeps a record of each session's state, and blocks a paused session.
@@ -244,6 +315,7 @@ EOF
       # Shown to Claude at session start, so it can tell the user setup is unfinished.
       [ -f "$PLIST" ] || echo "Sleepwalk is enabled but its sleep watcher is not installed, so nothing will be handed off when the lid closes. Suggest the user run /sleepwalk:install."
       trust_hint "$cwd"
+      cloud_hint "$cwd"
       update_rec "$sid" --arg sid "$sid" --arg cwd "$cwd" --arg tp "$transcript" --argjson t "$t" \
         '.session_id = $sid | .cwd = $cwd | .transcript_path = $tp | .state = (.state // "idle") | .last_activity = $t'
       maybe_prune ;;
@@ -326,7 +398,8 @@ set timeout [lindex $argv 0]
 set claude [lindex $argv 1]
 set prompt [lindex $argv 2]
 log_user 0
-spawn -noecho $claude --cloud $prompt
+set debug [lindex $argv 3]
+spawn -noecho $claude --debug-file $debug --cloud $prompt
 expect {
   -re {teleport[^\n]*(session_[A-Za-z0-9]+)} {
     puts "ID $expect_out(1,string)"; flush stdout
@@ -343,15 +416,17 @@ expect {
 # cloud_create <brief> <session-id> <deadline>: starts a cloud session for $PWD, gives it
 # the brief, and prints its id. The brief goes as a message with `-p --cloud <id>`, which
 # reports ok only for a session that exists, so it also confirms the create; it is
-# retried until the deadline. Prints nothing on failure, and says why in the log.
+# retried until the deadline. Prints nothing on failure, and says why in the log. On
+# success it also prints, on a second line, where the cloud copy came from
+# (cloud_source_of), read from Claude Code's debug log of the create.
 cloud_create() {
   local exp="$HANDOFF_HOME/cloud-create-$2.exp" res="$HANDOFF_HOME/cloud-create-$2.res"
-  local pid id="" sent=0 out="" wait
+  local dbg="$HANDOFF_HOME/cloud-create-$2.debug" pid id="" sent=0 out="" wait
   wait=$(( $3 - $(now) ))
   [ "$wait" -gt 0 ] || { log "no time left to create a cloud session"; return 0; }
   printf '%s' "$CREATE_EXP" > "$exp"
   : > "$res"
-  SLEEPWALK_INTERNAL=1 expect -f "$exp" "$((wait > 2 ? wait - 1 : wait))" "$(claude_bin)" "$HOLDING_PROMPT" > "$res" 2>&1 &
+  SLEEPWALK_INTERNAL=1 expect -f "$exp" "$((wait > 2 ? wait - 1 : wait))" "$(claude_bin)" "$HOLDING_PROMPT" "$dbg" > "$res" 2>&1 &
   pid=$!
   while [ "$(now)" -lt "$3" ]; do
     id="$(sed -n 's/^ID //p' "$res" | head -1)"
@@ -369,6 +444,7 @@ cloud_create() {
   kill "$pid" 2>/dev/null
   if [ "$sent" = 1 ]; then
     echo "$id"
+    cloud_source_of "$dbg"
   elif [ -n "$id" ]; then
     log "cloud session $id was created but did not accept the brief: $(printf '%s' "$out" | head -c 300)"
   elif grep -q '^TRUST_PROMPT' "$res"; then
@@ -376,7 +452,7 @@ cloud_create() {
   else
     log "claude --cloud reported no session ($(tr -s '\n' ' ' < "$res" | head -c 200))"
   fi
-  rm -f "$exp" "$res"
+  rm -f "$exp" "$res" "$dbg"
 }
 
 # undo_handoff: puts the checkout back as it was before a handoff that failed. Drops the
@@ -401,7 +477,7 @@ undo_handoff() {
 }
 
 handoff_one() {
-  local f="$1" dry="$2" deadline="$3" sid cwd transcript branch default newb brief cloud_id url t0
+  local f="$1" dry="$2" deadline="$3" sid cwd transcript branch default newb brief cloud_id url t0 created src
   local orig prev_remote made_branch=0 made_commit=0 pushed=0
   t0="$(now)"
   sid="$(basename "$f" .json)"
@@ -450,16 +526,20 @@ handoff_one() {
 
   brief="$(make_brief "$transcript" "$branch")"
   # Leave time before the deadline to undo the push and record the result.
-  cloud_id="$(cloud_create "$brief" "$sid" $((deadline - 4)))"
+  created="$(cloud_create "$brief" "$sid" $((deadline - 4)))"
+  cloud_id="$(printf '%s\n' "$created" | sed -n 1p)"
+  src="$(printf '%s\n' "$created" | sed -n 2p)"
   if [ -z "$cloud_id" ]; then
     undo_handoff
     fail_handoff "$sid" "could not start a cloud session (see the log)"
     return
   fi
   url="https://claude.ai/code/$cloud_id"
-  update_rec "$sid" --arg id "$cloud_id" --arg url "$url" --arg b "$branch" --argjson t "$(now)" \
-    '.handoff = {status: "cloud", cloud_id: $id, url: $url, branch: $b, at: $t}'
+  update_rec "$sid" --arg id "$cloud_id" --arg url "$url" --arg b "$branch" --arg src "$src" --argjson t "$(now)" \
+    '.handoff = {status: "cloud", cloud_id: $id, url: $url, branch: $b, at: $t} | if $src != "" then .handoff.source = $src else . end'
   log "handed $sid ($cwd, $branch) to cloud session $cloud_id $url after $(( $(now) - t0 ))s"
+  record_cloud_source "$(git remote get-url origin)" "$src"
+  case "$src" in upload:*) log "  $sid: cannot push from the cloud. $(upload_note "$(git remote get-url origin)" "${src#upload:}")" ;; esac
 }
 
 cmd_sleep() {
@@ -802,7 +882,7 @@ maybe_prune() {
 }
 
 cmd_status() {
-  local f t; t="$(now)"
+  local f t src origin; t="$(now)"
   printf '%-10s %-6s %-8s %-10s %s\n' SESSION STATE IDLE HANDOFF "DIRECTORY / CLOUD"
   for f in "$SESSIONS"/*.json; do
     [ -f "$f" ] || continue
@@ -812,6 +892,11 @@ cmd_status() {
         (.handoff.status // "-"),
         (.cwd + (if .handoff.url then "  " + .handoff.url elif .handoff.error then "  " + .handoff.error else "" end))
       ] | @tsv' "$f" | awk -F'\t' '{printf "%-10s %-6s %-8s %-10s %s\n", $1, $2, $3, $4, $5}'
+  done
+  for f in "$HANDOFF_HOME"/repos/*; do
+    [ -f "$f" ] || continue
+    IFS=$'\t' read -r src origin < "$f"
+    case "$src" in upload:*) echo "cloud push: $(repo_name "$origin"): $(upload_note "$origin" "${src#upload:}")" ;; esac
   done
   if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then echo "sleep watcher: running"; else echo "sleep watcher: not running (sleepwalk install)"; fi
 }
