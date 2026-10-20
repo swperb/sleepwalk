@@ -66,6 +66,8 @@ the folder your projects are in (usually Documents). Allow it.
 
 **While you work.** The plugin's hooks keep a small record for each Claude Code session:
 its folder, its transcript, and whether it is *busy* (a turn is running) or *idle*.
+A subagent's tool calls keep its session counted as busy, but never move the session's
+folder, even when the subagent works in its own worktree.
 
 **When you close the lid.** A small LaunchAgent, `sleepwatch`, gets macOS's "will sleep"
 notice and holds sleep off for a few seconds. For each busy session, one per working tree:
@@ -182,6 +184,10 @@ terminal, `~/.claude/sleepwalk/bin/sleepwalk`:
 - **Processes the session started keep running.** Sleepwalk pauses the session's tool
   calls, but a build or script it had already started carries on when the Mac wakes. If
   it changes files, `--teleport` offers to stash them.
+- **Subagent worktrees stay behind.** Only the session's own tree is committed and
+  pushed. If its subagents were working in separate worktrees (`.claude/worktrees`),
+  their uncommitted changes stay on your Mac. The log and the cloud brief say which
+  worktrees still had changes.
 - **Old records clean themselves up.** At most once an hour, at session start and on wake,
   Sleepwalk forgets sessions teleported back over a day ago, sessions and handoffs idle for
   a week, resume `.command` files nobody ran, and leftovers from killed processes. The

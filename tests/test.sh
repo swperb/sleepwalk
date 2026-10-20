@@ -307,6 +307,69 @@ check "install --plugin adds no settings hooks" [ "$(jq '[.hooks[][] .hooks[] | 
 check "install --plugin still writes the launch agent" [ -f "$SLEEPWALK_PLIST" ]
 check "SessionStart is quiet once installed" [ -z "$(hook SessionStart sess-gggg7777)" ]
 
+# === subagent hook events ===============================================================
+# A subagent's tool calls carry its parent's session_id plus agent_id and agent_type, and
+# the subagent's own cwd: an isolated .claude/worktrees/agent-* checkout. They must keep
+# the session alive without moving its folder or changing its state. Self-contained.
+git init -q --bare "$T/sa-origin.git"
+git init -q -b main "$T/sa"
+( cd "$T/sa" && git remote add origin "$T/sa-origin.git" && echo one > a.txt && git add a.txt \
+  && git commit -q -m init && git push -q origin main && git switch -q -c feature \
+  && git worktree add -q .claude/worktrees/agent-a1 -b agent-a1 \
+  && git worktree add -q .claude/worktrees/agent-b2 -b agent-b2 \
+  && echo main-work >> a.txt && echo sub-work > .claude/worktrees/agent-a1/s.txt )
+SA="$T/sa"; SA_A1="$SA/.claude/worktrees/agent-a1"; SA_B2="$SA/.claude/worktrees/agent-b2"
+cp "$T/transcript.jsonl" "$T/sa-transcript.jsonl"
+sa_hook() { # sa_hook <event> <cwd> [agent_id] [session]
+  jq -n --arg e "$1" --arg c "$2" --arg a "${3:-}" --arg s "${4:-sess-sa01}" --arg tp "$T/sa-transcript.jsonl" \
+    '{session_id: $s, hook_event_name: $e, cwd: $c, transcript_path: $tp, permission_mode: "default"}
+     + (if $a == "" then {} else {agent_id: $a, agent_type: "general-purpose"} end)' | "$TOOL" hook
+}
+sa_age() { # sa_age <minutes>: makes the session and its transcript look that old
+  jq --argjson t $(( $(date +%s) - $1 * 60 )) '.last_activity = $t' "$SLEEPWALK_HOME/sessions/sess-sa01.json" > "$T/sa.tmp" \
+    && mv "$T/sa.tmp" "$SLEEPWALK_HOME/sessions/sess-sa01.json"
+  touch -t "$(date -v-"$1"M +%Y%m%d%H%M.%S)" "$T/sa-transcript.jsonl"
+}
+sa_hook UserPromptSubmit "$SA"
+sa_hook PreToolUse "$SA"
+sa_age 25
+sa_hook PreToolUse "$SA_A1" a1a1a1a1
+check "a subagent's tool call keeps the session's folder" [ "$(rec sess-sa01 | jq -r .cwd)" = "$SA" ]
+check "and records the subagent's worktree" [ "$(rec sess-sa01 | jq -c .worktrees)" = "[\"$SA_A1\"]" ]
+check "and counts as activity" [ $(( $(date +%s) - $(rec sess-sa01 | jq .last_activity) )) -lt 60 ]
+sa_hook Stop "$SA_A1" a1a1a1a1
+check "a subagent's Stop does not mark the session idle" [ "$(rec sess-sa01 | jq -r .state)" = busy ]
+sa_hook SessionEnd "$SA_A1" a1a1a1a1
+check "a subagent's SessionEnd does not drop the session" [ -f "$SLEEPWALK_HOME/sessions/sess-sa01.json" ]
+sa_hook PreToolUse "$SA_B2"
+check "without agent_id, a call from an agent worktree of the session's folder is a subagent's" \
+  [ "$(rec sess-sa01 | jq -c '[.cwd, .worktrees]')" = "[\"$SA\",[\"$SA_A1\",\"$SA_B2\"]]" ]
+sa_hook PreToolUse "$SA_A1" a1a1a1a1
+check "worktrees are listed once, most recent last" [ "$(rec sess-sa01 | jq -c .worktrees)" = "[\"$SA_B2\",\"$SA_A1\"]" ]
+sa_hook PreToolUse "$SA_A1" zzzz sess-sa99
+check "a subagent event for an untracked session records nothing" [ ! -f "$SLEEPWALK_HOME/sessions/sess-sa99.json" ]
+
+# A parent waiting on subagents writes nothing to its own transcript; their tool calls
+# keep it eligible past STALE_MINUTES.
+sa_age 25
+SLEEPWALK_LID=closed "$TOOL" sleep --dry-run
+check "a quiet parent with no subagent activity is not handed off" [ ! -f "$SLEEPWALK_HOME/dry-run-brief-sess-sa01.txt" ]
+sa_hook PreToolUse "$SA_A1" a1a1a1a1
+SLEEPWALK_LID=closed "$TOOL" sleep --dry-run
+check "a parent whose subagents are working is handed off" [ -f "$SLEEPWALK_HOME/dry-run-brief-sess-sa01.txt" ]
+check "the brief names the subagent worktree left with uncommitted work" \
+  grep -q "^  - $SA_A1\$" "$SLEEPWALK_HOME/dry-run-brief-sess-sa01.txt"
+check "but not a clean one" sh -c "! grep -q '$SA_B2' '$SLEEPWALK_HOME/dry-run-brief-sess-sa01.txt'"
+check "the log names it too" grep -q "subagent worktree $SA_A1 has uncommitted changes" "$SLEEPWALK_HOME/handoff.log"
+
+SLEEPWALK_LID=closed "$TOOL" sleep
+check "the handoff pushes the session's own tree" [ "$(git -C "$T/sa-origin.git" show feature:a.txt 2>/dev/null | tail -1)" = main-work ]
+check "without committing the agent worktrees into it" \
+  [ -z "$(git -C "$T/sa-origin.git" ls-tree -r --name-only feature -- .claude)" ]
+check "and leaves the subagent's uncommitted work in place" [ "$(git -C "$SA_A1" status --porcelain)" = "?? s.txt" ]
+"$TOOL" release sess-sa01 >/dev/null
+sa_hook SessionEnd "$SA"
+
 # --- WIP commit: nested repositories, agent worktrees and large files ------------------
 # Claude Code puts subagent worktrees in .claude/worktrees/<name>, and people keep other
 # clones inside a checkout. `git add -A` would commit each as a broken gitlink (mode
