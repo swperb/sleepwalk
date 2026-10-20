@@ -23,6 +23,7 @@ RECENT_MINUTES="${RECENT_MINUTES:-30}" # how recent an idle session's activity m
 STALE_MINUTES="${STALE_MINUTES:-20}" # a "busy" session quiet for longer than this is treated as idle
 SLEEP_BUDGET="${SLEEP_BUDGET:-22}"   # seconds the sleep step may take; macOS forces sleep at about 30
 INCLUDE_UNTRACKED="${INCLUDE_UNTRACKED:-1}" # commit untracked, non-ignored files in the handoff commit
+MAX_FILE_MB="${MAX_FILE_MB:-50}"    # leave files bigger than this out of the handoff commit (GitHub refuses 100 MB)
 AUTO_RESUME="${AUTO_RESUME:-1}"     # on wake, open a terminal that teleports the session back
 WRAPUP_WAIT="${WRAPUP_WAIT:-45}"    # seconds to give the cloud session to push before teleporting
 NETWORK_WAIT="${NETWORK_WAIT:-120}"  # seconds to wait for the network after waking
@@ -203,7 +204,7 @@ EOF
 # Builds the cloud agent's instructions from the session transcript: the original
 # request, then the most recent conversation, trimmed to BRIEF_CHARS.
 make_brief() {
-  local transcript="$1" branch="$2" excerpt
+  local transcript="$1" branch="$2" skipped="${3:-}" excerpt left=""
   excerpt="$(jq -rs --argjson max "$BRIEF_CHARS" '
     def texts: if type == "string" then [.]
       else [.[]? | select(.type == "text") | .text] end
@@ -216,11 +217,15 @@ make_brief() {
     | "ORIGINAL REQUEST:\n\($first)\n\nRECENT CONVERSATION (oldest first, may be cut at the start):\n\($recent | .[-$max:])"
   ' "$transcript" 2>/dev/null)"
   [ -n "$excerpt" ] || excerpt="(The local transcript could not be read; work from the repository and the latest commits.)"
+  [ -n "$skipped" ] && left="
+These paths were left out of that commit and exist only on the laptop: nested git repositories (such as Claude Code's agent worktrees) and files too large to push. Do not expect them in the repository; work without them, or recreate what you need.
+$(list_left_out "$skipped")
+"
   cat <<EOF
 You are taking over a Claude Code session that was running on the user's laptop. The laptop went to sleep, so the session was handed to you automatically by sleepwalk. The user is away and cannot answer questions; make reasonable decisions and note them.
 
 The branch $branch holds the local work, including a final "WIP: hand off to cloud" commit with whatever was uncommitted. Follow the repository's CLAUDE.md or AGENTS.md.
-
+$left
 Continue the task where the local session left off. Commit and push small, working steps often, because the user may come back at any moment and pull your branch back to the laptop. If you receive a message saying the user is back, commit and push everything, then stop.
 
 $excerpt
@@ -319,6 +324,64 @@ cloud_create() {
   rm -f "$exp" "$res"
 }
 
+# --- the WIP commit -----------------------------------------------------------------
+# Some uncommitted things must stay out of the WIP commit. An untracked nested git
+# repository (Claude Code's agent worktrees in .claude/worktrees/<name>, or any other
+# clone inside the checkout) would go in as a gitlink with no .gitmodules entry, which the
+# cloud session cannot check out. A file over MAX_FILE_MB would make the push fail. Both
+# are left in the working tree, untouched, and named in the commit message, the brief and
+# the log. These functions take paths relative to the top of the working tree; run them
+# there. Paths are one per line, so a path with a newline in it is not handled.
+
+# left_out: prints "<path><TAB><reason>" for each thing the WIP commit leaves out. A
+# nested repository's path ends in /. Changes nothing, so a dry run can use it too.
+left_out() {
+  local mb="$MAX_FILE_MB"
+  case "$mb" in ''|*[!0-9]*) mb=50 ;; esac
+  if [ "$INCLUDE_UNTRACKED" = 1 ]; then
+    # Without --directory, ls-files names untracked folders only when they are nested
+    # repositories, and then with a trailing /.
+    git ls-files -z -o --exclude-standard | tr '\0' '\n' | grep '/$' | sed 's/$/	a nested git repository/'
+  fi
+  [ "$mb" -gt 0 ] || return 0
+  { [ "$INCLUDE_UNTRACKED" = 1 ] && git ls-files -z -o --exclude-standard; git ls-files -z -m; } | tr '\0' '\n' \
+    | grep -v '/$' | sed 's|^|./|' | tr '\n' '\0' \
+    | xargs -0 -J % find % -prune -type f -size +"${mb}"M 2>/dev/null \
+    | sed "s|^\./||;s/\$/	over ${mb} MB/"
+  return 0
+}
+
+# stage_changes <left-out>: stages everything for the WIP commit except what left_out
+# named, and prints "<path><TAB><reason>" for any other nested repository it had to take
+# back out of the index (one the user staged by hand). A gitlink already in HEAD, or one
+# that .gitmodules names, is a real submodule and is committed as usual.
+stage_changes() {
+  local p mode=-u gitmods
+  [ "$INCLUDE_UNTRACKED" = 1 ] && mode=-A
+  { printf ':/\0'
+    printf '%s\n' "$1" | cut -f1 | while IFS= read -r p; do
+      [ -n "$p" ] && printf ':(exclude,literal)%s\0' "${p%/}"
+    done
+  } | git add "$mode" --pathspec-from-file=- --pathspec-file-nul || return 1
+  # Something left out may have been staged earlier by hand: unstage it again.
+  printf '%s\n' "$1" | cut -f1 | while IFS= read -r p; do
+    [ -n "$p" ] && git reset -q -- ":(literal)${p%/}" >/dev/null 2>&1
+  done
+  gitmods="$(git config -f .gitmodules --get-regexp '\.path$' 2>/dev/null | cut -d' ' -f2-)"
+  git -c core.quotePath=false diff --cached --raw --no-renames --diff-filter=A \
+    | awk -F'\t' '$1 ~ /^:[0-7]+ 160000 / { print $2 }' \
+    | while IFS= read -r p; do
+        printf '%s\n' "$gitmods" | grep -qxF -- "$p" && continue
+        git rm -q --cached -- ":(literal)$p" && printf '%s/\ta nested git repository\n' "$p"
+      done
+  return 0
+}
+
+# list_left_out <left-out>: one "- <path> (<reason>)" line each.
+list_left_out() {
+  printf '%s\n' "$1" | awk -F'\t' 'NF { print "- " $1 " (" $2 ")" }'
+}
+
 # undo_handoff: puts the checkout back as it was before a handoff that failed. Drops the
 # WIP commit (its changes stay in the working tree), returns to the original branch, and
 # takes the branch back off the remote if it was pushed. Uses handoff_one's variables.
@@ -342,7 +405,7 @@ undo_handoff() {
 
 handoff_one() {
   local f="$1" dry="$2" deadline="$3" sid cwd transcript branch default newb brief cloud_id url t0
-  local orig prev_remote made_branch=0 made_commit=0 pushed=0
+  local orig prev_remote made_branch=0 made_commit=0 pushed=0 top skipped more body line
   t0="$(now)"
   sid="$(field "$f" .session_id)"
   cwd="$(field "$f" .cwd)"
@@ -368,17 +431,29 @@ handoff_one() {
     branch="$newb"
   fi
 
+  top="$(git rev-parse --show-toplevel)"
+  skipped="$(cd "$top" && left_out)"
   if [ "$dry" = 1 ]; then
     log "dry run $sid: would commit, push $branch and start a cloud session from $cwd"
-    make_brief "$transcript" "$branch" > "$HANDOFF_HOME/dry-run-brief-$sid.txt"
+    printf '%s\n' "$skipped" | awk -F'\t' -v s="$sid" 'NF { print "dry run " s ": would leave out " $1 " (" $2 ")" }' \
+      | while IFS= read -r line; do log "$line"; done
+    make_brief "$transcript" "$branch" "$skipped" > "$HANDOFF_HOME/dry-run-brief-$sid.txt"
     return
   fi
 
   prev_remote="$(git rev-parse -q --verify "refs/remotes/origin/$branch" 2>/dev/null)"
-  if [ "$INCLUDE_UNTRACKED" = 1 ]; then git add -A; else git add -u; fi
+  more="$(cd "$top" && stage_changes "$skipped")" \
+    || { undo_handoff; fail_handoff "$sid" "git add failed"; return; }
+  [ -n "$more" ] && skipped="$(printf '%s\n%s' "$skipped" "$more" | grep .)"
+  printf '%s\n' "$skipped" | awk -F'\t' -v s="$sid" 'NF { print "  " s ": left out " $1 " (" $2 ")" }' \
+    | while IFS= read -r line; do log "$line"; done
+  body="Committed automatically by sleepwalk for Claude Code session $sid."
+  [ -n "$skipped" ] && body="$body
+
+Left out of this commit, still only on the laptop:
+$(list_left_out "$skipped")"
   if ! git diff --cached --quiet; then
-    git commit -q -s --no-verify -m "WIP: hand off to cloud while the laptop sleeps" \
-      -m "Committed automatically by sleepwalk for Claude Code session $sid." \
+    git commit -q -s --no-verify -m "WIP: hand off to cloud while the laptop sleeps" -m "$body" \
       || { undo_handoff; fail_handoff "$sid" "git commit failed"; return; }
     made_commit=1
   fi
@@ -388,7 +463,7 @@ handoff_one() {
   pushed=1
   log "  $sid: committed and pushed $branch after $(( $(now) - t0 ))s"
 
-  brief="$(make_brief "$transcript" "$branch")"
+  brief="$(make_brief "$transcript" "$branch" "$skipped")"
   # Leave time before the deadline to undo the push and record the result.
   cloud_id="$(cloud_create "$brief" "$sid" $((deadline - 4)))"
   if [ -z "$cloud_id" ]; then

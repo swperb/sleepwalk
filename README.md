@@ -73,7 +73,11 @@ notice and holds sleep off for a few seconds. For each busy session, one per wor
 1. If the checkout is on the default branch, the work moves to a new
    `sleepwalk/<time>-<session>` branch, so work in progress never lands on `main`.
 2. Everything uncommitted is committed as `WIP: hand off to cloud while the laptop
-   sleeps` and pushed.
+   sleeps` and pushed. Two things stay behind on the laptop, untouched: nested git
+   repositories (such as Claude Code's agent worktrees in `.claude/worktrees/`, or other
+   clones inside the checkout) and files over `MAX_FILE_MB`. The commit message, the log
+   and the cloud session's brief list what was left out. Real submodules are committed
+   as usual.
 3. A cloud session starts and receives a brief: your original request and the latest
    part of the conversation, with instructions to carry on, push small steps, and stop
    when you are back.
@@ -145,6 +149,7 @@ terminal, `~/.claude/sleepwalk/bin/sleepwalk`:
 | `SCOPE` | `busy` | `busy` hands off sessions mid-turn; `recent` also ones used in the last `RECENT_MINUTES` |
 | `STALE_MINUTES` | `20` | A busy session with no sign of life for this long counts as idle. Raise it for very long builds |
 | `INCLUDE_UNTRACKED` | `1` | Commit untracked, non-ignored files too |
+| `MAX_FILE_MB` | `50` | Leave files bigger than this out of the WIP commit, so the push is not refused (GitHub's limit is 100 MB). `0` for no limit |
 | `AUTO_RESUME` | `1` | Open a Terminal on wake; `0` shows a notification instead |
 | `WRAPUP_WAIT` | `45` | Seconds the cloud session gets to push before teleporting |
 | `TERMINAL_APP` | `Terminal` | For example `iTerm` |

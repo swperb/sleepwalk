@@ -304,5 +304,73 @@ check "install --plugin adds no settings hooks" [ "$(jq '[.hooks[][] .hooks[] | 
 check "install --plugin still writes the launch agent" [ -f "$SLEEPWALK_PLIST" ]
 check "SessionStart is quiet once installed" [ -z "$(hook SessionStart sess-gggg7777)" ]
 
+# --- WIP commit: nested repositories, agent worktrees and large files ------------------
+# Claude Code puts subagent worktrees in .claude/worktrees/<name>, and people keep other
+# clones inside a checkout. `git add -A` would commit each as a broken gitlink (mode
+# 160000, no .gitmodules); they must stay out of the WIP commit, as must files too big to
+# push. A real submodule already in HEAD keeps working.
+mkrepo sublib
+mkrepo nestrepo
+( cd "$T/nestrepo" && rm w.txt && head -c 1000 /dev/zero > data.bin \
+  && git -c protocol.file.allow=always submodule add -q "$T/sublib.git" lib 2>/dev/null \
+  && git add data.bin && git commit -q -m "add lib" && git push -q origin main \
+  && git worktree add -q .claude/worktrees/agent-x -b agent-x \
+  && git init -q scratch && echo x > scratch/f \
+  && git init -q vendored && echo v > vendored/f && git -C vendored add f && git -C vendored commit -q -m v \
+  && echo lib2 > lib/new.txt && git -C lib add new.txt && git -C lib commit -q -m lib2 \
+  && echo work > w.txt && mkdir docs && echo n > "docs/my notes.txt" \
+  && head -c 2097152 /dev/zero > big.bin && head -c 2097152 /dev/zero > data.bin )
+nest_status() { git -C "$T/nestrepo" status --porcelain | sort | tr '\n' ' '; }
+nest_before="$(nest_status)"
+hook PreToolUse sess-nr01 "$T/nestrepo"
+MAX_FILE_MB=1 SLEEPWALK_LID=closed "$TOOL" sleep --dry-run
+nbrief="$SLEEPWALK_HOME/dry-run-brief-sess-nr01.txt"
+check "dry run: the brief lists the large file left behind" grep -q 'big.bin' "$nbrief"
+check "dry run: the brief lists the nested repositories left behind" sh -c "grep -q '.claude/worktrees/agent-x' '$nbrief' && grep -q 'scratch' '$nbrief'"
+check "dry run: the tree is untouched" [ "$(nest_status)" = "$nest_before" ]
+MAX_FILE_MB=1 SLEEPWALK_LID=closed "$TOOL" sleep
+check "nested repos: the handoff goes through" [ "$(rec sess-nr01 | jq -r .handoff.status)" = cloud ]
+nbr="$(rec sess-nr01 | jq -r .handoff.branch)"
+check "the WIP commit has no gitlink but the real submodule" \
+  [ "$(git -C "$T/nestrepo.git" ls-tree -r "$nbr" | awk '$2 == "commit" { print $4 }')" = lib ]
+check "the real submodule's new commit is in the WIP commit" \
+  [ "$(git -C "$T/nestrepo.git" rev-parse "$nbr:lib")" = "$(git -C "$T/nestrepo/lib" rev-parse HEAD)" ]
+check "small untracked files are in the WIP commit" \
+  sh -c "git -C '$T/nestrepo.git' cat-file -e '$nbr:w.txt' && git -C '$T/nestrepo.git' cat-file -e '$nbr:docs/my notes.txt'"
+check "a large untracked file is left out" sh -c "! git -C '$T/nestrepo.git' cat-file -e '$nbr:big.bin' 2>/dev/null"
+check "a large change to a tracked file is left out" [ "$(git -C "$T/nestrepo.git" cat-file -s "$nbr:data.bin")" = 1000 ]
+check "what was left out stays in the tree, untouched" \
+  [ "$(nest_status)" = " M data.bin ?? .claude/ ?? big.bin ?? scratch/ ?? vendored/ " ]
+check "the agent worktree still works" [ "$(git -C "$T/nestrepo/.claude/worktrees/agent-x" branch --show-current)" = agent-x ]
+check "the commit message lists what was left out" \
+  sh -c "git -C '$T/nestrepo' log -1 --format=%b | grep -q 'big.bin' && git -C '$T/nestrepo' log -1 --format=%b | grep -q 'vendored'"
+check "the cloud brief lists what was left out" sh -c "cat '$SLEEPWALK_HOME'/claude-args-* | tr '\0' '\n' | grep -q 'scratch/'"
+check "the log lists what was left out" grep -q 'left out .claude/worktrees/agent-x/ (a nested git repository)' "$SLEEPWALK_HOME/handoff.log"
+
+# A gitlink staged by hand is taken back out, also when the session runs in a subfolder.
+mkrepo neststaged
+( cd "$T/neststaged" && mkdir src && echo s > src/s.txt && git worktree add -q .claude/worktrees/agent-z -b agent-z \
+  && git add -A 2>/dev/null )
+hook PreToolUse sess-nr03 "$T/neststaged/src"
+SLEEPWALK_LID=closed "$TOOL" sleep
+nbr="$(rec sess-nr03 | jq -r .handoff.branch)"
+check "a hand-staged gitlink: the handoff goes through" [ "$(rec sess-nr03 | jq -r .handoff.status)" = cloud ]
+check "the hand-staged gitlink is not in the WIP commit" [ -z "$(git -C "$T/neststaged.git" ls-tree -r "$nbr" | awk '$2 == "commit"')" ]
+check "files outside the session's subfolder are committed" git -C "$T/neststaged.git" cat-file -e "$nbr:w.txt"
+check "the worktree is left untracked" [ "$(git -C "$T/neststaged" status --porcelain)" = "?? .claude/" ]
+
+# A failed handoff in such a tree puts it back exactly as it was.
+mkrepo nestundo
+( cd "$T/nestundo" && git switch -q -c topic && git push -q origin topic \
+  && git worktree add -q .claude/worktrees/agent-y -b agent-y && git init -q scratch \
+  && head -c 2097152 /dev/zero > big.bin && echo more >> a.txt )
+undo_state() { ( cd "$T/nestundo" && git status --porcelain | sort; git rev-parse HEAD; git branch --show-current; git diff | shasum ); }
+undo_before="$(undo_state)"
+hook PreToolUse sess-nr02 "$T/nestundo"
+CLAUDE_BIN="$T/fake-claude-lost" MAX_FILE_MB=1 SLEEP_BUDGET=10 SLEEPWALK_LID=closed "$TOOL" sleep
+check "nested repos: a failed handoff is recorded" [ "$(rec sess-nr02 | jq -r .handoff.status)" = failed ]
+check "and the tree is exactly as it was" [ "$(undo_state)" = "$undo_before" ]
+check "and the remote branch is back where it was" [ "$(git -C "$T/nestundo.git" rev-parse topic)" = "$(git -C "$T/nestundo" rev-parse HEAD)" ]
+
 echo
 [ "$fails" = 0 ] && echo "all tests passed" || { echo "$fails failed"; exit 1; }
