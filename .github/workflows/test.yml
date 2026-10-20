@@ -1,0 +1,21 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: brew install shellcheck jq || true
+      - name: Build the watcher
+        run: swiftc -O src/sleepwatch.swift -o "$RUNNER_TEMP/sleepwatch"
+      - name: Shellcheck
+        run: shellcheck -S warning bin/sleepwalk tests/test.sh
+      - name: Test suite
+        run: bash tests/test.sh
