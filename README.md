@@ -35,7 +35,8 @@ in the cloud, lid opened, session teleported back):
 | Committing and pushing the work in progress | 0 to 2 s |
 | How long Sleepwalk holds off sleep | 7.9 s at most (from the macOS power log) |
 | Lid opened to cloud session told to wrap up | 5 s |
-| Test suite | 81 checks in about 15 s, no network or launchd needed |
+| Full rehearsal through launchd (`sleepwalk simulate`), lid close to cloud running | 7 s |
+| Test suite | 94 checks in about 30 s, no network or launchd needed |
 
 ## Why this does not exist already
 
@@ -90,6 +91,24 @@ commit, push and stop, and opens a Terminal window. After up to 45 seconds (pres
 to skip), it runs `claude --teleport`, which checks out the cloud branch and loads the
 whole cloud conversation.
 
+## Rehearse it without closing the lid
+
+`sleepwalk simulate` runs the whole round trip while you watch, with the Mac awake: the
+lid reads as closed for the handoff, then a nap, then the lid-open steps, including the
+Terminal window that teleports the session back.
+
+```bash
+sleepwalk simulate                    # lists what it would hand off, then asks
+sleepwalk simulate --nap 120 --offline 15 --only 91ca97bd
+```
+
+It goes through the running watcher, so it tests what launchd actually runs, not just
+the script (`--direct` runs the steps in the current shell instead). The handoff is real:
+the work is pushed and a cloud session starts. `--offline` keeps the network "down" for
+that many seconds after waking, so you can watch the wake step wait for it; a configured
+hotspot is logged rather than joined. The Claude Code session that runs the rehearsal
+sits it out, so you can ask Claude to run it.
+
 ## Folder trust
 
 Claude Code asks "do you trust this folder?" the first time it works in a folder. For
@@ -133,6 +152,7 @@ terminal, `~/.claude/sleepwalk/bin/sleepwalk`:
 | `release <session>` | Drops a handoff and unpauses the local copy |
 | `trust <folder>` | Records Claude Code trust for exactly this folder |
 | `hotspot [name]` | Lists saved iPhone hotspots, or picks one to join when offline |
+| `simulate` | Rehearses a lid close, a nap and a lid open for real, with the Mac awake |
 | `sleep --dry-run` | Shows what a sleep would do, and writes the brief, without doing it |
 
 ## Settings
